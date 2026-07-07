@@ -281,10 +281,15 @@ def test_pi3x(
 def test_depth(
     image_path: str,
     server_url: str = "http://localhost:20019",
+    backend: str = "v2",
+    output_mode: str = "depth",
+    return_metrics: bool = False,
+    render_views: bool = False,
+    use_mock: bool = False,
     output_dir: str = "outputs/tool_test",
 ) -> Optional[str]:
     """
-    Directly test Depth Estimation tool.
+    Directly test Depth Estimation tool (V2 or V3 backend).
     """
     from spagent.tools import DepthEstimationTool
 
@@ -296,18 +301,45 @@ def test_depth(
     logger.info("Depth Estimation Tool Test")
     logger.info("=" * 60)
     logger.info(f"  Input image  : {image_path}")
+    logger.info(f"  Backend      : {backend}")
     logger.info(f"  Server URL   : {server_url}")
+    logger.info(f"  Output mode  : {output_mode}")
+    logger.info(f"  Use mock     : {use_mock}")
     logger.info(f"  Output dir   : {output_dir}")
     logger.info("-" * 60)
 
-    tool = DepthEstimationTool(use_mock=False, server_url=server_url)
-    result = tool.call(image_path=image_path)
+    if backend == "v3":
+        tool = DepthEstimationTool(
+            use_mock=use_mock,
+            server_url=server_url,
+            backend="v3",
+        )
+        result = tool.call(
+            image_path=image_path,
+            output_mode=output_mode,
+            return_metrics=return_metrics,
+            render_views=render_views,
+        )
+    else:
+        tool = DepthEstimationTool(use_mock=use_mock, server_url=server_url)
+        result = tool.call(image_path=image_path)
 
     if not result.get("success"):
         logger.error(f"Depth tool failed: {result.get('error', 'unknown error')}")
         return None
 
     logger.info("Depth estimation succeeded!")
+
+    # Log extra V3 fields
+    if backend == "v3":
+        logger.info(f"  Output mode     : {result.get('output_mode', 'N/A')}")
+        logger.info(f"  PLY path        : {result.get('ply_path', 'N/A')}")
+        logger.info(f"  GS PLY path     : {result.get('gs_ply_path', 'N/A')}")
+        if result.get("metrics"):
+            logger.info(f"  Metrics         : {result['metrics']}")
+        if result.get("rendered_views"):
+            logger.info(f"  Rendered views  : {len(result['rendered_views'])} views")
+
     src_path = result.get("output_path")
     if src_path and os.path.exists(src_path):
         os.makedirs(output_dir, exist_ok=True)
@@ -1021,6 +1053,33 @@ def parse_args():
         help="Use mock service instead of real API (for testing without keys).",
     )
 
+    # --- Depth V3 specific ---
+    depth_group = parser.add_argument_group("Depth V3 options")
+    depth_group.add_argument(
+        "--backend",
+        type=str,
+        default="v2",
+        choices=["v2", "v3"],
+        help="Depth backend: 'v2' (default) or 'v3' for DA3NESTED-GIANT-LARGE-1.1.",
+    )
+    depth_group.add_argument(
+        "--output_mode",
+        type=str,
+        default="depth",
+        choices=["depth", "metric_depth", "point_cloud", "gaussians"],
+        help="V3 output mode (default: depth).",
+    )
+    depth_group.add_argument(
+        "--return_metrics",
+        action="store_true",
+        help="V3: include spatial metrics in result.",
+    )
+    depth_group.add_argument(
+        "--render_views",
+        action="store_true",
+        help="V3: include rendered view images in result.",
+    )
+
     return parser.parse_args()
 
 
@@ -1059,10 +1118,15 @@ def main():
         )
 
     elif args.tool == "depth":
-        server = args.server_url or "http://localhost:20019"
+        server = args.server_url or ("http://localhost:20039" if args.backend == "v3" else "http://localhost:20019")
         result_path = test_depth(
             image_path=args.image[0],
             server_url=server,
+            backend=args.backend,
+            output_mode=args.output_mode,
+            return_metrics=args.return_metrics,
+            render_views=args.render_views,
+            use_mock=args.use_mock,
             output_dir=args.output_dir,
         )
 

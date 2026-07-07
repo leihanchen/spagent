@@ -63,6 +63,7 @@ DEFAULT_SERVER_URLS: Dict[str, str] = {
     "mapanything": "http://127.0.0.1:20033",
     "orient_anything_v2": "http://127.0.0.1:20034",
     "vace": "http://127.0.0.1:20034",
+    "depth_v3": "http://127.0.0.1:20039",
     "sana": "http://127.0.0.1:30000",
     "yoloe": "http://127.0.0.1:8000",
     "supervision": "http://127.0.0.1:8000",
@@ -76,7 +77,7 @@ TOOL_CATALOG: List[ToolCatalogEntry] = [
         DepthEstimationTool,
         "2d_perception",
         "depth_estimation_tool",
-        {"server_url": DEFAULT_SERVER_URLS["depth"]},
+        {"server_url": DEFAULT_SERVER_URLS["depth"], "backend": "v2"},
     ),
     ToolCatalogEntry(
         "segmentation",
