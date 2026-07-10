@@ -28,7 +28,7 @@ class DepthEstimationTool(Tool):
     """
 
     BACKENDS = ("v2", "v3")
-    V3_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians")
+    V3_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians", "features")
 
     def __init__(
         self,
@@ -54,18 +54,20 @@ class DepthEstimationTool(Tool):
         # --- description varies by backend ---
         if backend == "v3":
             description = (
-                "Generate depth maps, metric depth (meters), point clouds, or 3D "
-                "Gaussian splats from one or more images using Depth Anything V3 "
-                "(DA3NESTED-GIANT-LARGE-1.1). Supports multi-view input for better "
-                "geometry.\n\n"
+                "Generate depth maps, metric depth (meters), point clouds, 3D "
+                "Gaussian splats, or hidden features from one or more images using "
+                "Depth Anything V3 (DA3NESTED-GIANT-LARGE-1.1). Supports "
+                "multi-view input for better geometry.\n\n"
                 "When to use: spatial relationship questions (closer/farther), "
                 "metric distance estimation, 3D scene reconstruction, occlusion "
-                "reasoning, or scene layout analysis.\n"
+                "reasoning, scene layout analysis, or extracting DINO features "
+                "for downstream tasks.\n"
                 "When NOT to use: object naming/counting (prefer detection), "
                 "pixel masks (prefer segmentation), or novel camera viewpoints "
                 "(prefer pi3/pi3x).\n"
                 "Example: call with image_path='scene.jpg' and output_mode='metric_depth' "
-                "to get absolute distance information."
+                "to get absolute distance information, or output_mode='features' "
+                "to extract last-layer hidden features."
             )
         else:
             description = (

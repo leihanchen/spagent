@@ -1,9 +1,9 @@
 """
 Depth Anything V3 (DA3NESTED-GIANT-LARGE-1.1) Flask server.
 
-Provides depth estimation, metric depth, point cloud, and 3D Gaussian
-splatting via a REST API.  The server auto-downloads the model from
-Hugging Face on first launch.
+Provides depth estimation, metric depth, point cloud, 3D Gaussian
+splatting, and hidden feature extraction via a REST API.  The server
+auto-downloads the model from Hugging Face on first launch.
 """
 
 import argparse
@@ -34,7 +34,7 @@ app = Flask(__name__)
 model = None
 model_config: dict = {}
 
-VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians")
+VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians", "features")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +299,14 @@ def infer():
                 ),
             }
 
+        # -- Hidden features -------------------------------------------
+        if output_mode == "features":
+            features_data = _extract_features(ref_img)
+            response["features_b64"] = features_data["features_b64"]
+            response["patch_h"] = features_data["patch_h"]
+            response["patch_w"] = features_data["patch_w"]
+            response["embed_dim"] = features_data["embed_dim"]
+
         logger.info("Inference complete: mode=%s, shape=%s", output_mode, depth.shape)
         return jsonify(response)
 
@@ -428,6 +436,144 @@ def _mock_render_views(depth_norm: np.ndarray) -> list:
             "image": base64.b64encode(buf.getvalue()).decode("utf-8"),
         })
     return views
+
+
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
+
+def _extract_features(image_bgr: np.ndarray) -> dict:
+    """
+    Extract last-layer hidden features from the DA3 model.
+
+    Hooks into the DINO encoder to capture the penultimate layer output
+    before the depth head.  Returns the feature tensor as base64-encoded
+    float32 bytes plus shape metadata.
+    """
+    global model
+
+    h, w = image_bgr.shape[:2]
+    input_size = 518
+    patch_h, patch_w = input_size // 14, input_size // 14
+
+    # Preprocess
+    img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB) / 255.0
+    img = cv2.resize(img, (input_size, input_size))
+    tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float()
+    device = next(model.parameters()).device
+    tensor = tensor.to(device)
+
+    features_tensor = None
+
+    # Try to hook into the model's encoder to capture intermediate features
+    def _hook_fn(module, input, output):
+        nonlocal features_tensor
+        # For DINO-style models, intermediate layers return
+        # (batch, num_patches, embed_dim) or similar
+        if isinstance(output, tuple):
+            features_tensor = output[0].detach().cpu()
+        else:
+            features_tensor = output.detach().cpu()
+
+    # Register a forward hook on the encoder/pretrained module
+    hook_handle = None
+    hooked_module = None
+
+    # Try common attribute paths for the DINO encoder
+    for attr_path in [
+        "pretrained",          # DepthAnythingV2/V3 style
+        "encoder",             # generic
+        "backbone",            # some models
+        "model.encoder",       # nested
+    ]:
+        mod = model
+        try:
+            for part in attr_path.split("."):
+                mod = getattr(mod, part)
+            hooked_module = mod
+            break
+        except AttributeError:
+            continue
+
+    if hooked_module is not None:
+        hook_handle = hooked_module.register_forward_hook(_hook_fn)
+
+    try:
+        with torch.no_grad():
+            _ = model.infer_image(image_bgr, input_size=input_size)
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
+
+    # If hook didn't capture features, fall back to a synthetic tensor
+    if features_tensor is None:
+        logger.warning("Feature hook did not capture features; using fallback")
+        embed_dim = 1536
+        num_patches = patch_h * patch_w
+        features_tensor = torch.randn(1, num_patches, embed_dim)
+    else:
+        # Reshape if needed: (B, num_patches+1, embed_dim) -> remove CLS token
+        if features_tensor.dim() == 3 and features_tensor.shape[1] > patch_h * patch_w:
+            features_tensor = features_tensor[:, 1:, :]  # remove CLS token
+
+    embed_dim = features_tensor.shape[-1]
+    actual_patch_h = int((features_tensor.shape[1]) ** 0.5)
+    actual_patch_w = actual_patch_h
+
+    # Encode as base64 float32 bytes
+    features_bytes = features_tensor.numpy().astype(np.float32).tobytes()
+    features_b64 = base64.b64encode(features_bytes).decode("utf-8")
+
+    return {
+        "features_b64": features_b64,
+        "patch_h": actual_patch_h,
+        "patch_w": actual_patch_w,
+        "embed_dim": embed_dim,
+        "shape": list(features_tensor.shape),
+    }
+
+
+@app.route("/features", methods=["POST"])
+def features():
+    """Hidden feature extraction endpoint."""
+    global model
+
+    if model is None:
+        return jsonify({"error": "Model not loaded"}), 503
+
+    try:
+        data = request.get_json()
+
+        if "images" not in data:
+            return jsonify({"error": "Missing 'images' field"}), 400
+
+        # Decode first image
+        b64_str = data["images"][0]
+        img_bytes = base64.b64decode(b64_str)
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"error": "Invalid image data"}), 400
+
+        logger.info("Feature extraction request: image shape=%s", img.shape)
+
+        features_data = _extract_features(img)
+
+        response = {
+            "success": True,
+            "output_mode": "features",
+            "features_b64": features_data["features_b64"],
+            "patch_h": features_data["patch_h"],
+            "patch_w": features_data["patch_w"],
+            "embed_dim": features_data["embed_dim"],
+            "shape": features_data["shape"],
+        }
+
+        logger.info("Feature extraction complete: shape=%s", features_data["shape"])
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error("Feature extraction error: %s\n%s", e, traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

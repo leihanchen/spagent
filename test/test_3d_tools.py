@@ -116,7 +116,7 @@ class TestDepthV3Tool:
 
         # Check output_mode enum
         assert params["properties"]["output_mode"]["enum"] == [
-            "depth", "metric_depth", "point_cloud", "gaussians"
+            "depth", "metric_depth", "point_cloud", "gaussians", "features"
         ]
 
     def test_v3_invalid_backend_error(self):
@@ -200,6 +200,35 @@ class TestDepthV3Tool:
         assert "rendered_views" in result
         assert len(result["rendered_views"]) == 3  # front, top, side
         assert result["rendered_views"][0]["view"] in ("front", "top", "side")
+
+    def test_v3_features_mode(self):
+        """V3 features mode should return .pth file with hidden features."""
+        import torch
+
+        from spagent.tools import DepthEstimationTool
+
+        tool = DepthEstimationTool(use_mock=True, backend="v3")
+        result = tool.call(
+            image_path="assets/example.png",
+            output_mode="features",
+        )
+
+        assert result["success"] is True
+        assert result["output_mode"] == "features"
+        assert "features_path" in result
+        assert result["features_path"] is not None
+        assert os.path.exists(result["features_path"])
+
+        # Load and verify the .pth file
+        data = torch.load(result["features_path"], map_location="cpu", weights_only=False)
+        assert "image_id" in data
+        assert "features" in data
+        assert "patch_h" in data
+        assert "patch_w" in data
+        assert "embed_dim" in data
+        assert data["features"].dim() == 3
+        assert data["features"].shape[0] == 1  # batch dim
+        assert data["embed_dim"] == 1536
 
     # -------------------------------------------------------------------------
     # Error handling tests

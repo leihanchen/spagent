@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class MockDepthV3Service:
     """Mock V3 depth estimation service — no GPU or checkpoint needed."""
 
-    VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians")
+    VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians", "features")
 
     def __init__(self, output_dir: str = "outputs"):
         self.output_dir = output_dir
@@ -111,6 +111,12 @@ class MockDepthV3Service:
                     shape, base_name
                 )
 
+            # -- features -----------------------------------------------
+            if output_mode == "features":
+                features_path = os.path.join(self.output_dir, f"{base_name}_features.pth")
+                self._create_mock_features(features_path, stem, shape)
+                result["features_path"] = features_path
+
             # -- metrics -------------------------------------------------
             if return_metrics:
                 result["metrics"] = self._mock_metrics(shape)
@@ -158,6 +164,7 @@ class MockDepthV3Service:
             "metric_depth": "Metric Depth (mock) — values in meters",
             "point_cloud": "Point Cloud (mock)",
             "gaussians": "3D Gaussians (mock)",
+            "features": "Hidden Features (mock)",
         }.get(output_mode, output_mode)
 
         draw.rectangle([10, 10, 400, 80], fill=(0, 0, 0, 128))
@@ -258,3 +265,27 @@ end_header
             "point_count": h * w,
             "coverage_percent": 98.7,
         }
+
+    def _create_mock_features(
+        self, output_path: str, image_id: str, shape: List[int]
+    ) -> None:
+        """Save a synthetic last-layer hidden feature tensor as .pth."""
+        import torch
+
+        h, w = shape
+        patch_h, patch_w = h // 14, w // 14
+        embed_dim = 1536  # DINO giant embed dim
+        num_patches = patch_h * patch_w
+
+        # Synthetic feature tensor
+        features = np.random.randn(1, num_patches, embed_dim).astype(np.float32)
+
+        data = {
+            "image_id": image_id,
+            "features": torch.from_numpy(features),
+            "patch_h": patch_h,
+            "patch_w": patch_w,
+            "embed_dim": embed_dim,
+        }
+        torch.save(data, output_path)
+        logger.info("Mock V3 features saved: %s", output_path)

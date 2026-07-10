@@ -2,7 +2,8 @@
 HTTP client for Depth Anything V3 server.
 
 Sends images to the V3 Flask server and returns depth maps,
-metric depth, point clouds, 3D gaussians, and spatial metrics.
+metric depth, point clouds, 3D gaussians, hidden features,
+and spatial metrics.
 """
 
 import base64
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 class DepthV3Client:
     """Client for the Depth Anything V3 (DA3NESTED-GIANT-LARGE-1.1) server."""
 
-    VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians")
+    VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians", "features")
 
     def __init__(self, server_url: str = "http://127.0.0.1:20039", output_dir: str = "outputs"):
         self.server_url = server_url.rstrip("/")
@@ -57,7 +58,8 @@ class DepthV3Client:
 
         Args:
             image_path: Path to input image, or list of paths for multi-view.
-            output_mode: ``"depth"`` | ``"metric_depth"`` | ``"point_cloud"`` | ``"gaussians"``.
+            output_mode: ``"depth"`` | ``"metric_depth"`` | ``"point_cloud"`` |
+                         ``"gaussians"`` | ``"features"``.
             return_metrics: Include spatial metrics in response.
             render_views: Include base64 rendered view images.
 
@@ -124,6 +126,80 @@ class DepthV3Client:
             logger.error("V3 client error: %s", e)
             return {"success": False, "error": str(e)}
 
+    def extract_features(
+        self,
+        image_path: str,
+        output_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Extract last-layer hidden features from the V3 model.
+
+        Args:
+            image_path: Path to input image.
+            output_path: Optional path to save .pth feature file.
+
+        Returns:
+            Result dict with features_path and metadata.
+        """
+        try:
+            if not os.path.exists(image_path):
+                return {"success": False, "error": f"Image file not found: {image_path}"}
+
+            img = cv2.imread(image_path)
+            if img is None:
+                return {"success": False, "error": f"Cannot read image: {image_path}"}
+
+            _, buf = cv2.imencode(".jpg", img)
+            img_b64 = base64.b64encode(buf).decode("utf-8")
+
+            resp = requests.post(
+                f"{self.server_url}/features",
+                json={"images": [img_b64]},
+                headers={"Content-Type": "application/json"},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            server_result = resp.json()
+
+            if not server_result.get("success"):
+                return {
+                    "success": False,
+                    "error": server_result.get("error", "Server returned failure"),
+                }
+
+            # Decode and save features
+            stem = Path(image_path).stem
+            timestamp = int(time.time())
+            base_name = f"depth_v3_{stem}_{timestamp}"
+
+            if output_path is None:
+                output_path = os.path.join(self.output_dir, f"{base_name}_features.pth")
+
+            self._save_features_pth(
+                server_result["features_b64"],
+                stem,
+                server_result["patch_h"],
+                server_result["patch_w"],
+                server_result["embed_dim"],
+                output_path,
+            )
+
+            return {
+                "success": True,
+                "backend": "v3",
+                "output_mode": "features",
+                "features_path": output_path,
+                "patch_h": server_result["patch_h"],
+                "patch_w": server_result["patch_w"],
+                "embed_dim": server_result["embed_dim"],
+            }
+
+        except requests.exceptions.ConnectionError:
+            return {"success": False, "error": f"V3 server unreachable: {self.server_url}"}
+        except Exception as e:
+            logger.error("V3 feature extraction error: %s", e)
+            return {"success": False, "error": str(e)}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -172,6 +248,19 @@ class DepthV3Client:
         if server_result.get("metrics"):
             result["metrics"] = server_result["metrics"]
 
+        # -- hidden features -------------------------------------------
+        if server_result.get("features_b64"):
+            features_path = os.path.join(self.output_dir, f"{base_name}_features.pth")
+            self._save_features_pth(
+                server_result["features_b64"],
+                stem,
+                server_result.get("patch_h", 0),
+                server_result.get("patch_w", 0),
+                server_result.get("embed_dim", 0),
+                features_path,
+            )
+            result["features_path"] = features_path
+
         logger.info("V3 client: result saved, mode=%s", result.get("output_mode"))
         return result
 
@@ -183,3 +272,31 @@ class DepthV3Client:
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         if img is not None:
             cv2.imwrite(output_path, img)
+
+    @staticmethod
+    def _save_features_pth(
+        features_b64: str,
+        image_id: str,
+        patch_h: int,
+        patch_w: int,
+        embed_dim: int,
+        output_path: str,
+    ) -> None:
+        """Decode base64 features and save as .pth file."""
+        import torch
+
+        features_bytes = base64.b64decode(features_b64)
+        features_array = np.frombuffer(features_bytes, np.float32).copy()
+        num_patches = patch_h * patch_w
+        if num_patches > 0 and embed_dim > 0:
+            features_array = features_array.reshape(1, num_patches, embed_dim)
+
+        data = {
+            "image_id": image_id,
+            "features": torch.from_numpy(features_array),
+            "patch_h": patch_h,
+            "patch_w": patch_w,
+            "embed_dim": embed_dim,
+        }
+        torch.save(data, output_path)
+        logger.info("V3 features saved: %s", output_path)
