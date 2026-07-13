@@ -79,7 +79,7 @@ cd "$PROJECT_ROOT"
 
 # Load system modules
 module load python/3.12.4
-module load cuda/12.6
+module load cuda/13.2
 module load opencv/4.13.0
 module load gcc/12.3             # needed for compiling gsplat CUDA extensions
 
@@ -102,7 +102,7 @@ fi
 source "$VENV_DIR/bin/activate"
 
 # Install dependencies (skip if torch is already installed — venv was created by a prior run)
-if python3 -c "import torch" 2>/dev/null; then
+if python3 -c "import torch; import flask; import requests" 2>/dev/null; then
   echo ">>> Core dependencies already installed, skipping pip installs"
 else
   echo ">>> Installing dependencies..."
@@ -111,7 +111,7 @@ else
   # Core ML dependencies — use ComputeCanada wheels where available
   pip install --no-build-isolation \
     torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu126
+    --index-url https://download.pytorch.org/whl/cu132
 
   # Project dependencies (NO opencv pip — loaded via module above)
   pip install --no-build-isolation \
@@ -148,10 +148,21 @@ pip install --no-build-isolation \
 export PYTHONPATH="$DA3_DIR/src:$PROJECT_ROOT:${PYTHONPATH:-}"
 
 # Optional: gsplat for Gaussian head (needed for feature_source=gs_decoder)
-if ! pip install --no-build-isolation \
-  git+https://github.com/nerfstudio-project/gsplat.git@v1.4.0; then
-  echo ">>> gsplat install failed; GS decoder features may not be available"
-  echo ">>> Depth decoder features will still work"
+# Only install if using gs_decoder; skip if already installed; timeout after 10 min
+if [ "$FEATURE_SOURCE" = "gs_decoder" ]; then
+  if python3 -c "import gsplat" 2>/dev/null; then
+    echo ">>> gsplat already installed, skipping build"
+  else
+    echo ">>> Installing gsplat (this may take several minutes to compile CUDA kernels)..."
+    timeout 600 pip install --no-build-isolation \
+      git+https://github.com/nerfstudio-project/gsplat.git@v1.4.0 || {
+      echo ">>> gsplat install failed or timed out; GS decoder features may not be available"
+      echo ">>> Falling back to depth_decoder features"
+      FEATURE_SOURCE="depth_decoder"
+    }
+  fi
+else
+  echo ">>> Skipping gsplat install (feature_source=$FEATURE_SOURCE, gsplat only needed for gs_decoder)"
 fi
 
 # Install the project itself (editable so scripts/ imports work)
