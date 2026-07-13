@@ -32,6 +32,15 @@
 
 set -euo pipefail
 
+# Graceful cleanup on exit/timeout — kill the server process
+cleanup() {
+  echo ""
+  echo ">>> Cleanup: stopping server (PID ${SERVER_PID:-unknown})..."
+  kill ${SERVER_PID:-} 2>/dev/null || true
+  wait ${SERVER_PID:-} 2>/dev/null || true
+}
+trap cleanup EXIT TERM
+
 # =====================================================================
 # Configuration (override via command-line args after sbatch)
 # =====================================================================
@@ -101,35 +110,38 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 source "$VENV_DIR/bin/activate"
 
-# Install dependencies (skip if torch is already installed — venv was created by a prior run)
-if python3 -c "import torch; import flask; import requests" 2>/dev/null; then
-  echo ">>> Core dependencies already installed, skipping pip installs"
-else
-  echo ">>> Installing dependencies..."
-  pip install --no-build-isolation --upgrade pip setuptools wheel
+# Install dependencies
+# Heavy deps (torch, torchvision) are skipped if already present.
+# Lightweight deps (flask, requests, etc.) are always installed (fast, idempotent).
+echo ">>> Installing dependencies..."
+pip install --no-build-isolation --upgrade pip setuptools wheel
 
-  # Core ML dependencies — use ComputeCanada wheels where available
+# Core ML dependencies — skip if torch is already installed (saves ~5 min)
+if ! python3 -c "import torch" 2>/dev/null; then
   pip install --no-build-isolation \
     torch torchvision \
     --index-url https://download.pytorch.org/whl/cu132
-
-  # Project dependencies (NO opencv pip — loaded via module above)
-  pip install --no-build-isolation \
-    flask \
-    requests \
-    Pillow \
-    numpy \
-    huggingface_hub \
-    safetensors \
-    tqdm \
-    matplotlib \
-    scipy \
-    scikit-learn \
-    lxml \
-    einops \
-    omegaconf \
-    addict
+else
+  echo ">>> torch already installed, skipping"
 fi
+
+# Project dependencies (NO opencv pip — loaded via module above)
+# Always run: fast and idempotent; ensures missing packages like 'requests' get installed
+pip install --no-build-isolation \
+  flask \
+  requests \
+  Pillow \
+  numpy \
+  huggingface_hub \
+  safetensors \
+  tqdm \
+  matplotlib \
+  scipy \
+  scikit-learn \
+  lxml \
+  einops \
+  omegaconf \
+  addict
 
 # Depth Anything V3 — not on PyPI, and its full pip install pulls in heavy
 # deps (xformers, pycolmap, e3nn, open3d, opencv-python) that conflict with
