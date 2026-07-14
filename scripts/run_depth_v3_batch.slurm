@@ -209,8 +209,21 @@ if [[ "$FEATURE_SOURCE" == "gs_decoder" ]]; then
   fi
 fi
 
-echo ">>> Checking GPU..."
-python3 -c "import torch; print(f'  CUDA: {torch.cuda.is_available()}'); print(f'  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+echo ">>> Checking GPU (fail-closed)..."
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "ERROR: nvidia-smi not found — no GPU visible on this node"
+  exit 1
+fi
+nvidia-smi -L || { echo "ERROR: nvidia-smi -L failed"; exit 1; }
+python3 - <<'PY'
+import torch
+print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
+print(f"  device_count: {torch.cuda.device_count()}")
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    raise SystemExit("ERROR: CUDA not available to PyTorch — refusing to run on CPU")
+print(f"  GPU: {torch.cuda.get_device_name(0)}")
+print(f"  CUDA capability: {torch.cuda.get_device_capability(0)}")
+PY
 
 # =====================================================================
 # Start V3 server

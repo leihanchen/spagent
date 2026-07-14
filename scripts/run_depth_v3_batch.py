@@ -148,22 +148,46 @@ def resolve_image_path(
 def check_existing_outputs(
     output_dir: str, source: str, image_id: str, save_flags: Dict[str, bool]
 ) -> bool:
-    """Check if all requested outputs already exist for an image."""
+    """Check if all requested outputs already exist and are consistent.
+
+    When both metric depth and features are requested, features that are
+    older than the metric 16-bit map are treated as stale (e.g. left over
+    from a previous failed run) so the image is reprocessed.
+    """
     source_dir = os.path.join(output_dir, source)
 
     expected = []
     if save_flags.get("depth"):
         expected.append(os.path.join(source_dir, f"{image_id}_depth.png"))
+    metric_16bit = os.path.join(source_dir, f"{image_id}_metric_depth_16bit.png")
     if save_flags.get("metric_depth"):
         # Real metric map is the 16-bit PNG; npy holds summary + scale only
-        expected.append(os.path.join(source_dir, f"{image_id}_metric_depth_16bit.png"))
+        expected.append(metric_16bit)
         expected.append(os.path.join(source_dir, f"{image_id}_metric.npy"))
     if save_flags.get("gaussians"):
         expected.append(os.path.join(source_dir, f"{image_id}_gs.ply"))
+    features_path = os.path.join(source_dir, f"{image_id}_features.pth")
     if save_flags.get("features"):
-        expected.append(os.path.join(source_dir, f"{image_id}_features.pth"))
+        expected.append(features_path)
 
-    return all(os.path.exists(p) for p in expected)
+    if not all(os.path.exists(p) for p in expected):
+        return False
+
+    # Stale features: predate a newer metric map from a partial re-run
+    if (
+        save_flags.get("features")
+        and save_flags.get("metric_depth")
+        and os.path.exists(features_path)
+        and os.path.exists(metric_16bit)
+    ):
+        if os.path.getmtime(features_path) < os.path.getmtime(metric_16bit) - 1.0:
+            logger.info(
+                "Stale features for %s (older than metric 16-bit); will reprocess",
+                image_id,
+            )
+            return False
+
+    return True
 
 
 # =============================================================================
