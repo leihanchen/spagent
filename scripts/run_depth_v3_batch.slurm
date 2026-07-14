@@ -6,8 +6,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=h100:1
 #SBATCH --cpus-per-gpu=8
-#SBATCH --mem=32G
-#SBATCH --time=1:00:00
+#SBATCH --mem=64G
+#SBATCH --time=3:00:00
 #SBATCH --output=logs/depth_v3_batch_%j.out
 #SBATCH --error=logs/depth_v3_batch_%j.err
 #SBATCH --mail-type=ALL

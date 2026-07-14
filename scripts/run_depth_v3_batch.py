@@ -151,7 +151,7 @@ def check_existing_outputs(
     """Check if all requested outputs already exist and are consistent.
 
     When both metric depth and features are requested, features that are
-    older than the metric 16-bit map are treated as stale (e.g. left over
+    older than the float metric map are treated as stale (e.g. left over
     from a previous failed run) so the image is reprocessed.
     """
     source_dir = os.path.join(output_dir, source)
@@ -159,11 +159,10 @@ def check_existing_outputs(
     expected = []
     if save_flags.get("depth"):
         expected.append(os.path.join(source_dir, f"{image_id}_depth.png"))
-    metric_16bit = os.path.join(source_dir, f"{image_id}_metric_depth_16bit.png")
+    metric_depth_npy = os.path.join(source_dir, f"{image_id}_metric_depth.npy")
     if save_flags.get("metric_depth"):
-        # Real metric map is the 16-bit PNG; npy holds summary + scale only
-        expected.append(metric_16bit)
-        expected.append(os.path.join(source_dir, f"{image_id}_metric.npy"))
+        # Float32 HxW depth in meters (not a color PNG)
+        expected.append(metric_depth_npy)
     if save_flags.get("gaussians"):
         expected.append(os.path.join(source_dir, f"{image_id}_gs.ply"))
     features_path = os.path.join(source_dir, f"{image_id}_features.pth")
@@ -178,11 +177,11 @@ def check_existing_outputs(
         save_flags.get("features")
         and save_flags.get("metric_depth")
         and os.path.exists(features_path)
-        and os.path.exists(metric_16bit)
+        and os.path.exists(metric_depth_npy)
     ):
-        if os.path.getmtime(features_path) < os.path.getmtime(metric_16bit) - 1.0:
+        if os.path.getmtime(features_path) < os.path.getmtime(metric_depth_npy) - 1.0:
             logger.info(
-                "Stale features for %s (older than metric 16-bit); will reprocess",
+                "Stale features for %s (older than metric depth); will reprocess",
                 image_id,
             )
             return False
@@ -223,6 +222,11 @@ def run_batch(
         "start_time": time.time(),
     }
     per_image_status: List[Dict[str, Any]] = []
+    # Abort early if the Flask server dies mid-run (avoid burning walltime
+    # on thousands of "unreachable" failures after a crash/OOM kill).
+    consecutive_unreachable = 0
+    max_consecutive_unreachable = 5
+    aborted = False
 
     for entry in tqdm(entries, desc="Depth V3 batch"):
         image_rel_path = entry["image_rel_path"]
@@ -279,7 +283,7 @@ def run_batch(
             except Exception as e:
                 image_errors.append(f"depth: {e}")
 
-        # --- Metric depth (16-bit PNG + scale; npy = summary dict) ---
+        # --- Metric depth (float32 .npy meters + optional color vis) ---
         if save_flags.get("metric_depth"):
             try:
                 result = tool.call(
@@ -288,25 +292,24 @@ def run_batch(
                     return_metrics=True,
                 )
                 if result.get("success"):
-                    # Color visualization only
+                    # Color visualization only (not metric values)
                     _copy_output(
                         result.get("output_path"),
                         source_dir,
                         f"{image_id}_metric_depth_vis.png",
                     )
-                    # Recoverable metric map: depth_m = scale * u16 + offset
+                    # Float32 HxW depth in meters (no scale/offset needed)
                     _copy_output(
-                        result.get("metric_depth_16bit_path"),
+                        result.get("metric_depth_path"),
                         source_dir,
-                        f"{image_id}_metric_depth_16bit.png",
+                        f"{image_id}_metric_depth.npy",
                     )
-                    # Summary dict (metrics + scale/offset/formula)
-                    metrics = dict(result.get("metrics") or {})
-                    if result.get("metric_depth_scale"):
-                        for key, val in result["metric_depth_scale"].items():
-                            metrics.setdefault(key, val)
-                    npy_path = os.path.join(source_dir, f"{image_id}_metric.npy")
-                    np.save(npy_path, np.array(metrics, dtype=object))
+                    if result.get("metrics"):
+                        metrics_path = os.path.join(
+                            source_dir, f"{image_id}_metrics.json"
+                        )
+                        with open(metrics_path, "w") as f:
+                            json.dump(result["metrics"], f, indent=2)
                 else:
                     image_errors.append(f"metric_depth: {result.get('error', 'unknown')}")
             except Exception as e:
@@ -362,7 +365,22 @@ def run_batch(
                 "path": full_path,
                 "errors": image_errors,
             })
+            err_blob = " ".join(image_errors).lower()
+            if "unreachable" in err_blob or "connection" in err_blob:
+                consecutive_unreachable += 1
+            else:
+                consecutive_unreachable = 0
+            if consecutive_unreachable >= max_consecutive_unreachable:
+                logger.error(
+                    "Server unreachable for %d consecutive images; aborting batch "
+                    "to preserve walltime. Resume will continue remaining work.",
+                    consecutive_unreachable,
+                )
+                aborted = True
+                stats["aborted"] = True
+                break
         else:
+            consecutive_unreachable = 0
             stats["processed"] += 1
             per_image_status.append({
                 "image_id": image_id,
@@ -372,6 +390,10 @@ def run_batch(
 
     stats["end_time"] = time.time()
     stats["elapsed_seconds"] = stats["end_time"] - stats["start_time"]
+    if aborted:
+        stats["remaining_unprocessed"] = max(
+            0, stats["total"] - stats["processed"] - stats["skipped"] - stats["failed"]
+        )
 
     return {
         "stats": stats,
@@ -464,8 +486,8 @@ def parse_args():
         "--save-metric-depth",
         action="store_true",
         help=(
-            "Save metric depth: 16-bit PNG (meters via scale/offset) + "
-            "color vis PNG + summary dict in *_metric.npy."
+            "Save metric depth as float32 *_metric_depth.npy (meters) + "
+            "optional color vis PNG + *_metrics.json summary."
         ),
     )
     output_group.add_argument(
@@ -565,8 +587,15 @@ def main():
     logger.info("  Elapsed      : %.1f seconds", stats["elapsed_seconds"])
     logger.info("  Summary saved: %s", summary_path)
 
+    if stats.get("aborted"):
+        logger.error(
+            "Batch aborted early (server unreachable). remaining≈%s — resubmit to resume.",
+            stats.get("remaining_unprocessed", "?"),
+        )
+        sys.exit(2)
     if stats["failed"] > 0:
         logger.warning("%d images failed — see batch_summary.json for details", stats["failed"])
+        sys.exit(1)
 
 
 if __name__ == "__main__":
