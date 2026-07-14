@@ -40,7 +40,7 @@ IMAGE_ROOT="comm/val_and_test_images"
 OUTPUT_DIR="outputs/depth_v3_batch"
 SERVER_PORT=20039
 FEATURE_SOURCE="depth_decoder"   # depth_decoder | gs_decoder (needs gsplat)
-MAX_IMAGES="100"                 # empty string = all images
+MAX_IMAGES=""                 # empty string = all images
 CHECKPOINT_ID="depth-anything/DA3NESTED-GIANT-LARGE-1.1"
 
 while [[ $# -gt 0 ]]; do
@@ -297,9 +297,9 @@ if [[ $BATCH_EXIT -eq 0 ]]; then
   echo " Server log:       logs/depth_v3_server_${SLURM_JOB_ID}.log"
   echo "============================================================"
   echo " Metric artifacts per image:"
-  echo "   *_metric_depth_16bit.png  (uint16 meters via scale/offset)"
+  echo "   *_metric_depth.npy        (float32 meters, HxW)"
   echo "   *_metric_depth_vis.png    (color visualization only)"
-  echo "   *_metric.npy              (summary dict + scale/offset)"
+  echo "   *_metrics.json            (optional min/max summary)"
   echo "============================================================"
 else
   echo ""
