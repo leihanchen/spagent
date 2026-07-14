@@ -149,7 +149,10 @@ class TestDepthV3Tool:
         assert "intrinsics" in result["camera_pose"]
 
     def test_v3_metric_depth_mode(self):
-        """V3 metric_depth mode should return depth with metric values."""
+        """V3 metric_depth mode should return 16-bit metric PNG + scale summary."""
+        import numpy as np
+        from PIL import Image
+
         from spagent.tools import DepthEstimationTool
 
         tool = DepthEstimationTool(use_mock=True, backend="v3")
@@ -165,6 +168,25 @@ class TestDepthV3Tool:
         assert "depth_min_m" in result["metrics"]
         assert "depth_max_m" in result["metrics"]
         assert "depth_mean_m" in result["metrics"]
+        # 16-bit metric map + linear scale for recovery
+        assert "metric_depth_16bit_path" in result
+        assert result["metric_depth_16bit_path"] is not None
+        assert os.path.exists(result["metric_depth_16bit_path"])
+        assert "scale" in result["metrics"]
+        assert "offset" in result["metrics"]
+        assert "formula" in result["metrics"]
+        assert result["metrics"]["formula"] == "depth_m = scale * uint16 + offset"
+
+        # Round-trip: recovered depth should match summary min/max within quant error
+        depth_u16 = np.array(Image.open(result["metric_depth_16bit_path"]))
+        assert depth_u16.dtype == np.uint16 or str(depth_u16.dtype).startswith("uint16") or depth_u16.dtype == np.int32
+        # PIL I;16 may load as int32; values still in 0..65535
+        depth_u16 = depth_u16.astype(np.uint16)
+        scale = float(result["metrics"]["scale"])
+        offset = float(result["metrics"]["offset"])
+        recovered = depth_u16.astype(np.float32) * scale + offset
+        assert abs(float(recovered.min()) - float(result["metrics"]["depth_min_m"])) < 1e-2
+        assert abs(float(recovered.max()) - float(result["metrics"]["depth_max_m"])) < 1e-2
 
     def test_v3_point_cloud_mode(self):
         """V3 point_cloud mode should return PLY file."""
@@ -201,8 +223,8 @@ class TestDepthV3Tool:
         assert len(result["rendered_views"]) == 3  # front, top, side
         assert result["rendered_views"][0]["view"] in ("front", "top", "side")
 
-    def test_v3_features_mode(self):
-        """V3 features mode should return .pth file with hidden features."""
+    def test_v3_features_depth_decoder(self):
+        """V3 features with depth_decoder should return .pth with 3D DPT decoder features."""
         import torch
 
         from spagent.tools import DepthEstimationTool
@@ -211,6 +233,7 @@ class TestDepthV3Tool:
         result = tool.call(
             image_path="assets/example.png",
             output_mode="features",
+            feature_source="depth_decoder",
         )
 
         assert result["success"] is True
@@ -223,12 +246,75 @@ class TestDepthV3Tool:
         data = torch.load(result["features_path"], map_location="cpu", weights_only=False)
         assert "image_id" in data
         assert "features" in data
-        assert "patch_h" in data
-        assert "patch_w" in data
-        assert "embed_dim" in data
+        assert "feature_h" in data
+        assert "feature_w" in data
+        assert "feature_dim" in data
+        assert "feature_type" in data
+        assert "feature_source" in data
+        assert "format_version" in data
+        # Format: [1, num_patches, feature_dim] — last dim is feature vector
         assert data["features"].dim() == 3
         assert data["features"].shape[0] == 1  # batch dim
-        assert data["embed_dim"] == 1536
+        assert data["features"].shape[2] == 256  # feature dim
+        assert data["feature_dim"] == 256
+        assert data["feature_type"] == "3d_dpt_decoder"
+        assert data["feature_source"] == "depth_decoder"
+        assert data["format_version"] == 2
+        # num_patches = feature_h * feature_w
+        assert data["features"].shape[1] == data["feature_h"] * data["feature_w"]
+
+    def test_v3_features_gs_decoder(self):
+        """V3 features with gs_decoder should return .pth with 3D GS decoder features."""
+        import torch
+
+        from spagent.tools import DepthEstimationTool
+
+        tool = DepthEstimationTool(use_mock=True, backend="v3")
+        result = tool.call(
+            image_path="assets/example.png",
+            output_mode="features",
+            feature_source="gs_decoder",
+        )
+
+        assert result["success"] is True
+        assert result["output_mode"] == "features"
+        assert "features_path" in result
+        assert result["features_path"] is not None
+        assert os.path.exists(result["features_path"])
+
+        # Load and verify the .pth file
+        data = torch.load(result["features_path"], map_location="cpu", weights_only=False)
+        assert "features" in data
+        assert "feature_type" in data
+        assert "feature_source" in data
+        # Same shape convention as depth_decoder: [1, num_patches, 256]
+        assert data["features"].dim() == 3
+        assert data["features"].shape[0] == 1
+        assert data["features"].shape[2] == 256
+        assert data["feature_dim"] == 256
+        assert data["feature_type"] == "3d_gs_decoder"
+        assert data["feature_source"] == "gs_decoder"
+        assert data["format_version"] == 2
+
+    def test_v3_features_spatial_structure(self):
+        """3D features should vary across patches (not uniform)."""
+        import torch
+
+        from spagent.tools import DepthEstimationTool
+
+        tool = DepthEstimationTool(use_mock=True, backend="v3")
+        result = tool.call(
+            image_path="assets/example.png",
+            output_mode="features",
+        )
+
+        assert result["success"] is True
+        data = torch.load(result["features_path"], map_location="cpu", weights_only=False)
+        features = data["features"]
+        # Features should vary across patches
+        assert features[0, 0].norm() != features[0, -1].norm()
+        # Different patches should have different feature vectors
+        assert not torch.allclose(features[0, 0, :], features[0, -1, :])
 
     # -------------------------------------------------------------------------
     # Error handling tests

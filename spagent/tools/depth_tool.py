@@ -55,19 +55,19 @@ class DepthEstimationTool(Tool):
         if backend == "v3":
             description = (
                 "Generate depth maps, metric depth (meters), point clouds, 3D "
-                "Gaussian splats, or hidden features from one or more images using "
+                "Gaussian splats, or 3D-aware features from one or more images using "
                 "Depth Anything V3 (DA3NESTED-GIANT-LARGE-1.1). Supports "
                 "multi-view input for better geometry.\n\n"
                 "When to use: spatial relationship questions (closer/farther), "
                 "metric distance estimation, 3D scene reconstruction, occlusion "
-                "reasoning, scene layout analysis, or extracting DINO features "
-                "for downstream tasks.\n"
+                "reasoning, scene layout analysis, or extracting 3D-aware DPT "
+                "decoder features for downstream tasks.\n"
                 "When NOT to use: object naming/counting (prefer detection), "
                 "pixel masks (prefer segmentation), or novel camera viewpoints "
                 "(prefer pi3/pi3x).\n"
                 "Example: call with image_path='scene.jpg' and output_mode='metric_depth' "
                 "to get absolute distance information, or output_mode='features' "
-                "to extract last-layer hidden features."
+                "to extract 3D-aware spatial features from the DPT depth decoder."
             )
         else:
             description = (
@@ -190,12 +190,25 @@ class DepthEstimationTool(Tool):
                     "type": "string",
                     "enum": list(self.V3_OUTPUT_MODES),
                     "description": (
-                        "Output mode: 'depth' — relative depth map (colored); "
-                        "'metric_depth' — absolute depth in meters; "
+                        "Output mode: 'depth' — relative depth map (color vis + 16-bit); "
+                        "'metric_depth' — absolute depth in meters (16-bit PNG + scale, color is vis only); "
                         "'point_cloud' — PLY point cloud; "
-                        "'gaussians' — 3D Gaussian Splatting (GS PLY + rendered views)."
+                        "'gaussians' — 3D Gaussian Splatting (GS PLY + rendered views); "
+                        "'features' — 3D-aware features from depth or Gaussian decoder "
+                        "(256-dim per patch, controlled by feature_source)."
                     ),
                     "default": "depth",
+                },
+                "feature_source": {
+                    "type": "string",
+                    "enum": ["depth_decoder", "gs_decoder"],
+                    "description": (
+                        "When output_mode='features', selects which decoder to extract "
+                        "features from: 'depth_decoder' (default) for DualDPT depth "
+                        "features, or 'gs_decoder' for GSDPT 3D Gaussian features "
+                        "(richest 3D representation, trained for novel view synthesis)."
+                    ),
+                    "default": "depth_decoder",
                 },
                 "return_metrics": {
                     "type": "boolean",
@@ -228,6 +241,7 @@ class DepthEstimationTool(Tool):
         output_mode: str = "depth",
         return_metrics: bool = False,
         render_views: bool = False,
+        feature_source: str = "depth_decoder",
     ) -> Dict[str, Any]:
         """
         Execute depth estimation.
@@ -235,15 +249,20 @@ class DepthEstimationTool(Tool):
         Args:
             image_path: Path to input image (V2: single string; V3: string or list).
             output_mode: V3 only — one of ``"depth"``, ``"metric_depth"``,
-                         ``"point_cloud"``, ``"gaussians"``.
+                         ``"point_cloud"``, ``"gaussians"``, ``"features"``.
             return_metrics: V3 only — include spatial metrics.
             render_views: V3 only — include rendered view images.
+            feature_source: V3 only — ``"depth_decoder"`` or ``"gs_decoder"``.
+                            Selects which decoder to extract features from
+                            when output_mode='features'.
 
         Returns:
             Depth estimation result dictionary.
         """
         if self.backend == "v3":
-            return self._call_v3(image_path, output_mode, return_metrics, render_views)
+            return self._call_v3(
+                image_path, output_mode, return_metrics, render_views, feature_source
+            )
         return self._call_v2(image_path)
 
     def _call_v2(self, image_path: str) -> Dict[str, Any]:
@@ -294,6 +313,7 @@ class DepthEstimationTool(Tool):
         output_mode: str,
         return_metrics: bool,
         render_views: bool,
+        feature_source: str = "depth_decoder",
     ) -> Dict[str, Any]:
         """Execute V3 depth estimation."""
         try:
@@ -316,9 +336,10 @@ class DepthEstimationTool(Tool):
                 }
 
             logger.info(
-                "Running V3 depth estimation: mode=%s, images=%d",
+                "Running V3 depth estimation: mode=%s, images=%d, feature_source=%s",
                 output_mode,
                 len(paths),
+                feature_source,
             )
 
             # Delegate to client (or mock)
@@ -328,6 +349,7 @@ class DepthEstimationTool(Tool):
                 output_mode=output_mode,
                 return_metrics=return_metrics,
                 render_views=render_views,
+                feature_source=feature_source,
             )
 
             if result and result.get("success"):

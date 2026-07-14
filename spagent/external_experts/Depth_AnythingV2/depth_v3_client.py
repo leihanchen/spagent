@@ -261,11 +261,26 @@ class DepthV3Client:
             "camera_pose": server_result.get("camera_pose"),
         }
 
-        # -- depth visualization ---------------------------------------
+        # -- depth visualization (color PNG, not metric values) --------
         if server_result.get("depth_image"):
             depth_path = os.path.join(self.output_dir, f"{base_name}_depth.png")
             self._save_b64_image(server_result["depth_image"], depth_path)
             result["output_path"] = depth_path
+
+        # -- 16-bit metric-scale depth PNG + scale ---------------------
+        if server_result.get("metric_depth_u16_png"):
+            u16_path = os.path.join(
+                self.output_dir, f"{base_name}_metric_depth_16bit.png"
+            )
+            self._save_b64_bytes(server_result["metric_depth_u16_png"], u16_path)
+            result["metric_depth_16bit_path"] = u16_path
+
+        scale_info = server_result.get("metric_depth_scale") or {}
+        if scale_info:
+            result["metric_depth_scale"] = scale_info
+
+        if server_result.get("is_metric") is not None:
+            result["is_metric"] = server_result.get("is_metric")
 
         # -- PLY data --------------------------------------------------
         if server_result.get("ply_data"):
@@ -285,9 +300,14 @@ class DepthV3Client:
         if server_result.get("rendered_views"):
             result["rendered_views"] = server_result["rendered_views"]
 
-        # -- metrics ---------------------------------------------------
-        if server_result.get("metrics"):
-            result["metrics"] = server_result["metrics"]
+        # -- metrics (summary + 16-bit encode params) ------------------
+        metrics = dict(server_result.get("metrics") or {})
+        if scale_info:
+            for key in ("scale", "offset", "dtype", "formula", "is_metric"):
+                if key in scale_info and key not in metrics:
+                    metrics[key] = scale_info[key]
+        if metrics:
+            result["metrics"] = metrics
 
         # -- 3D-aware features -------------------------------------------
         if server_result.get("features_b64"):
@@ -323,12 +343,34 @@ class DepthV3Client:
 
     @staticmethod
     def _save_b64_image(b64_data: str, output_path: str) -> None:
-        """Decode a base64 image and write it to disk."""
+        """Decode a base64 color image and write it to disk."""
         img_bytes = base64.b64decode(b64_data)
         img_array = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         if img is not None:
             cv2.imwrite(output_path, img)
+
+    @staticmethod
+    def _save_b64_bytes(b64_data: str, output_path: str) -> None:
+        """Decode raw base64 bytes (e.g. 16-bit PNG) and write unchanged."""
+        with open(output_path, "wb") as f:
+            f.write(base64.b64decode(b64_data))
+
+    @staticmethod
+    def decode_depth_uint16(
+        png_path: str, scale: float, offset: float
+    ) -> np.ndarray:
+        """
+        Load a 16-bit depth PNG and recover float depth.
+
+        ``depth_m = scale * uint16 + offset``
+        """
+        depth_u16 = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
+        if depth_u16 is None:
+            raise FileNotFoundError(f"Cannot read 16-bit depth PNG: {png_path}")
+        if depth_u16.ndim == 3:
+            depth_u16 = depth_u16[:, :, 0]
+        return depth_u16.astype(np.float32) * float(scale) + float(offset)
 
     @staticmethod
     def _save_features_pth(

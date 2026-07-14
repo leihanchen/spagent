@@ -155,6 +155,8 @@ def check_existing_outputs(
     if save_flags.get("depth"):
         expected.append(os.path.join(source_dir, f"{image_id}_depth.png"))
     if save_flags.get("metric_depth"):
+        # Real metric map is the 16-bit PNG; npy holds summary + scale only
+        expected.append(os.path.join(source_dir, f"{image_id}_metric_depth_16bit.png"))
         expected.append(os.path.join(source_dir, f"{image_id}_metric.npy"))
     if save_flags.get("gaussians"):
         expected.append(os.path.join(source_dir, f"{image_id}_gs.ply"))
@@ -253,7 +255,7 @@ def run_batch(
             except Exception as e:
                 image_errors.append(f"depth: {e}")
 
-        # --- Metric depth ---
+        # --- Metric depth (16-bit PNG + scale; npy = summary dict) ---
         if save_flags.get("metric_depth"):
             try:
                 result = tool.call(
@@ -262,11 +264,25 @@ def run_batch(
                     return_metrics=True,
                 )
                 if result.get("success"):
-                    _copy_output(result.get("output_path"), source_dir, f"{image_id}_metric_depth.png")
-                    # Save raw metric depth as .npy
-                    if result.get("metrics"):
-                        npy_path = os.path.join(source_dir, f"{image_id}_metric.npy")
-                        np.save(npy_path, np.array(result["metrics"]))
+                    # Color visualization only
+                    _copy_output(
+                        result.get("output_path"),
+                        source_dir,
+                        f"{image_id}_metric_depth_vis.png",
+                    )
+                    # Recoverable metric map: depth_m = scale * u16 + offset
+                    _copy_output(
+                        result.get("metric_depth_16bit_path"),
+                        source_dir,
+                        f"{image_id}_metric_depth_16bit.png",
+                    )
+                    # Summary dict (metrics + scale/offset/formula)
+                    metrics = dict(result.get("metrics") or {})
+                    if result.get("metric_depth_scale"):
+                        for key, val in result["metric_depth_scale"].items():
+                            metrics.setdefault(key, val)
+                    npy_path = os.path.join(source_dir, f"{image_id}_metric.npy")
+                    np.save(npy_path, np.array(metrics, dtype=object))
                 else:
                     image_errors.append(f"metric_depth: {result.get('error', 'unknown')}")
             except Exception as e:
@@ -299,6 +315,7 @@ def run_batch(
                 result = tool.call(
                     image_path=full_path,
                     output_mode="features",
+                    feature_source=save_flags.get("feature_source", "depth_decoder"),
                 )
                 if result.get("success"):
                     _copy_output(
@@ -422,7 +439,10 @@ def parse_args():
     output_group.add_argument(
         "--save-metric-depth",
         action="store_true",
-        help="Save metric depth map (NPY + PNG).",
+        help=(
+            "Save metric depth: 16-bit PNG (meters via scale/offset) + "
+            "color vis PNG + summary dict in *_metric.npy."
+        ),
     )
     output_group.add_argument(
         "--save-gaussians",
@@ -432,7 +452,14 @@ def parse_args():
     output_group.add_argument(
         "--save-features",
         action="store_true",
-        help="Save last-layer hidden features (PTH).",
+        help="Save 3D-aware features (PTH, 256-dim per patch).",
+    )
+    output_group.add_argument(
+        "--feature-source",
+        type=str,
+        default="depth_decoder",
+        choices=["depth_decoder", "gs_decoder"],
+        help="Feature decoder: 'depth_decoder' (default) or 'gs_decoder' (3D Gaussian).",
     )
 
     # Limit for testing
@@ -454,10 +481,16 @@ def main():
         "metric_depth": args.save_metric_depth,
         "gaussians": args.save_gaussians,
         "features": args.save_features,
+        "feature_source": args.feature_source,
     }
 
-    if not any(save_flags.values()):
-        logger.error("No output flags specified. Use at least one of: --save-depth, --save-metric-depth, --save-gaussians, --save-features")
+    if not any(
+        save_flags[k] for k in ("depth", "metric_depth", "gaussians", "features")
+    ):
+        logger.error(
+            "No output flags specified. Use at least one of: "
+            "--save-depth, --save-metric-depth, --save-gaussians, --save-features"
+        )
         sys.exit(1)
 
     logger.info("=" * 60)

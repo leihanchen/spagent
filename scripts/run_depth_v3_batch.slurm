@@ -7,61 +7,51 @@
 #SBATCH --gpus-per-node=h100:1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=32G
-#SBATCH --time=4:00:00
+#SBATCH --time=1:00:00
 #SBATCH --output=logs/depth_v3_batch_%j.out
 #SBATCH --error=logs/depth_v3_batch_%j.err
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=leihan.chen@torontomu.ca
 
 # Batch Depth Anything V3 inference on the CoMM dataset.
-# Produces metric depth images + 3D Gaussian decoder features per image.
+# Saves metric 16-bit depth (+ color vis) and 3D-aware features per image.
 #
 # Usage:
 #   mkdir -p logs
 #   sbatch scripts/run_depth_v3_batch.slurm
-#
-# With custom options:
-#   sbatch scripts/run_depth_v3_batch.slurm
-#     --max-images 100
-#     --feature-source depth_decoder
-#     --output-dir outputs/depth_v3_batch_run2
-#
-# Multi-GPU: To use 2 GPUs, change --gpus-per-node=h100:2 and set
-#   NUM_SERVERS=2 below. The script will launch 2 server instances
-#  (ports 20039, 20040) and split the image list across them.
+#   sbatch scripts/run_depth_v3_batch.slurm --max-images 100 --feature-source depth_decoder
 
 set -euo pipefail
 
-# Graceful cleanup on exit/timeout — kill the server process
 cleanup() {
-  echo ""
-  echo ">>> Cleanup: stopping server (PID ${SERVER_PID:-unknown})..."
-  kill ${SERVER_PID:-} 2>/dev/null || true
-  wait ${SERVER_PID:-} 2>/dev/null || true
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    echo ">>> Cleanup: stopping server (PID ${SERVER_PID})..."
+    kill "${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT TERM
 
 # =====================================================================
-# Configuration (override via command-line args after sbatch)
+# Configuration (override via args after sbatch)
 # =====================================================================
 DATA_PATH="comm/test_data.pth"
 IMAGE_ROOT="comm/val_and_test_images"
 OUTPUT_DIR="outputs/depth_v3_batch"
 SERVER_PORT=20039
-FEATURE_SOURCE="depth_decoder"    # "depth_decoder" or "gs_decoder" (gs_decoder requires gsplat)
-MAX_IMAGES="100"                  # start with 100 images; set to "" for all 12K
+FEATURE_SOURCE="depth_decoder"   # depth_decoder | gs_decoder (needs gsplat)
+MAX_IMAGES="100"                 # empty string = all images
 CHECKPOINT_ID="depth-anything/DA3NESTED-GIANT-LARGE-1.1"
 
-# Parse extra args passed after sbatch
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --data-path)     DATA_PATH="$2";     shift 2 ;;
-    --image-root)    IMAGE_ROOT="$2";    shift 2 ;;
-    --output-dir)    OUTPUT_DIR="$2";    shift 2 ;;
+    --data-path)      DATA_PATH="$2";      shift 2 ;;
+    --image-root)     IMAGE_ROOT="$2";     shift 2 ;;
+    --output-dir)     OUTPUT_DIR="$2";     shift 2 ;;
     --feature-source) FEATURE_SOURCE="$2"; shift 2 ;;
-    --max-images)    MAX_IMAGES="$2";    shift 2 ;;
-    --checkpoint-id) CHECKPOINT_ID="$2"; shift 2 ;;
-    --server-port)   SERVER_PORT="$2";   shift 2 ;;
+    --max-images)     MAX_IMAGES="$2";     shift 2 ;;
+    --checkpoint-id)  CHECKPOINT_ID="$2";  shift 2 ;;
+    --server-port)    SERVER_PORT="$2";    shift 2 ;;
     *) echo "Unknown option: $1"; shift ;;
   esac
 done
@@ -69,9 +59,9 @@ done
 echo "============================================================"
 echo " Depth Anything V3 — CoMM Batch Inference"
 echo "============================================================"
-echo " Job ID:          $SLURM_JOB_ID"
-echo " Node:            $SLURMD_NODENAME"
-echo " GPU:             $CUDA_VISIBLE_DEVICES"
+echo " Job ID:          ${SLURM_JOB_ID:-local}"
+echo " Node:            ${SLURMD_NODENAME:-$(hostname)}"
+echo " GPU:             ${CUDA_VISIBLE_DEVICES:-}"
 echo " Data path:       $DATA_PATH"
 echo " Image root:      $IMAGE_ROOT"
 echo " Output dir:      $OUTPUT_DIR"
@@ -81,43 +71,37 @@ echo " Checkpoint:      $CHECKPOINT_ID"
 echo "============================================================"
 
 # =====================================================================
-# Environment setup
+# Environment
 # =====================================================================
 PROJECT_ROOT="/scratch/leihan/spagent"
 cd "$PROJECT_ROOT"
 
-# Load system modules
 module load python/3.12.4
 module load cuda/13.2
-module load opencv/4.13.0
-module load gcc/12.3             # needed for compiling gsplat CUDA extensions
+module load opencv/4.13.0   # system cv2 — do not pip install opencv-python
 
-# --- HuggingFace cache on /scratch (home quota is limited) ---
-HF_CACHE_DIR="/scratch/leihan/.cache/huggingface"
-mkdir -p "$HF_CACHE_DIR"
-export HF_HOME="$HF_CACHE_DIR"
-export HUGGINGFACE_HUB_CACHE="$HF_CACHE_DIR/hub"
-export TRANSFORMERS_CACHE="$HF_CACHE_DIR/transformers"
+export HF_HOME="/scratch/leihan/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+mkdir -p "$HF_HOME" logs "$OUTPUT_DIR"
 echo ">>> HF cache: $HF_HOME"
 
-# Create virtualenv if it doesn't exist
-# NOTE: opencv module must be loaded BEFORE venv activation so that
-#       cv2 is available inside the venv (ComputeCanada convention).
 VENV_DIR="$PROJECT_ROOT/.venv_depth_v3"
-if [ ! -d "$VENV_DIR" ]; then
+if [[ ! -d "$VENV_DIR" ]]; then
   echo ">>> Creating virtual environment..."
   python3 -m venv "$VENV_DIR"
 fi
+# shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
 
-# Install dependencies
-# Heavy deps (torch, torchvision) are skipped if already present.
-# Lightweight deps (flask, requests, etc.) are always installed (fast, idempotent).
-echo ">>> Installing dependencies..."
-pip install --no-build-isolation --upgrade pip setuptools wheel
+# ---------------------------------------------------------------------
+# Core deps (idempotent)
+# ---------------------------------------------------------------------
+echo ">>> Ensuring pip tooling..."
+pip install --no-build-isolation --upgrade pip setuptools wheel packaging -q
 
-# Core ML dependencies — skip if torch is already installed (saves ~5 min)
 if ! python3 -c "import torch" 2>/dev/null; then
+  echo ">>> Installing torch + torchvision (cu132)..."
   pip install --no-build-isolation \
     torch torchvision \
     --index-url https://download.pytorch.org/whl/cu132
@@ -125,169 +109,188 @@ else
   echo ">>> torch already installed, skipping"
 fi
 
-# Project dependencies (NO opencv pip — loaded via module above)
-# Always run: fast and idempotent; ensures missing packages like 'requests' get installed
-pip install --no-build-isolation \
-  flask \
-  requests \
-  Pillow \
-  numpy \
-  huggingface_hub \
-  safetensors \
-  tqdm \
-  matplotlib \
-  scipy \
-  scikit-learn \
-  lxml \
-  einops \
-  omegaconf \
-  addict
+# Runtime deps for our Flask server + DA3 monocular inference path.
+# Intentionally omit: opencv-python, xformers, open3d, pycolmap, gsplat
+# (module opencv supplies cv2; heavy optional DA3 export deps not needed).
+echo ">>> Installing runtime deps..."
+pip install --no-build-isolation -q \
+  flask requests Pillow numpy tqdm matplotlib \
+  huggingface_hub safetensors einops omegaconf addict evo \
+  imageio "moviepy==1.0.3" plyfile trimesh
 
-# Depth Anything V3 — not on PyPI, and its full pip install pulls in heavy
-# deps (xformers, pycolmap, e3nn, open3d, opencv-python) that conflict with
-# ComputeCanada modules.  Instead, clone the source and add to PYTHONPATH
-# so the server can import depth_anything_3 directly.
-echo ">>> Setting up Depth Anything V3 source..."
+# ---------------------------------------------------------------------
+# Install Depth Anything 3 (official package, no heavy optional deps)
+# ---------------------------------------------------------------------
 DA3_DIR="$PROJECT_ROOT/.depth_anything_3_src"
-if [ ! -d "$DA3_DIR" ]; then
-  git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git "$DA3_DIR"
+if [[ ! -d "$DA3_DIR/src/depth_anything_3" ]]; then
+  echo ">>> Cloning Depth-Anything-3..."
+  rm -rf "$DA3_DIR"
+  git clone --depth 1 https://github.com/ByteDance-Seed/Depth-Anything-3.git "$DA3_DIR"
+else
+  echo ">>> Depth-Anything-3 source present: $DA3_DIR"
 fi
-# Install only the lightweight build deps needed for the package metadata
-pip install --no-build-isolation \
-  hatchling hatch-vcs \
-  2>/dev/null || true
-# Add source to PYTHONPATH (avoids full dependency install)
-export PYTHONPATH="$DA3_DIR/src:$PROJECT_ROOT:${PYTHONPATH:-}"
 
-# Optional: gsplat for Gaussian head (needed for feature_source=gs_decoder)
-# Only install if using gs_decoder; skip if already installed; timeout after 10 min
-if [ "$FEATURE_SOURCE" = "gs_decoder" ]; then
+# Full `pip install -e .` pulls xformers/open3d/pycolmap/opencv-python.
+# Install package only (--no-deps) + runtime deps above.
+echo ">>> Installing depth-anything-3 (editable, --no-deps)..."
+pip install --no-build-isolation hatchling hatch-vcs editables -q
+if ! pip install --no-build-isolation -e "$DA3_DIR" --no-deps; then
+  echo ">>> Editable install failed; using PYTHONPATH only"
+fi
+export PYTHONPATH="$DA3_DIR/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# Eager import of export.colmap requires pycolmap (unavailable on CC).
+# Lazy-load export formats so monocular depth inference can import DA3.
+EXPORT_INIT="$DA3_DIR/src/depth_anything_3/utils/export/__init__.py"
+if [[ -f "$EXPORT_INIT" ]] && grep -q "from \.colmap import export_to_colmap" "$EXPORT_INIT" 2>/dev/null; then
+  echo ">>> Patching DA3 export/__init__.py for lazy optional imports..."
+  cat > "$EXPORT_INIT" <<'PY'
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+# Lazy export imports (spagent HPC patch): avoid requiring pycolmap/gsplat at import time.
+from depth_anything_3.specs import Prediction
+
+
+def export(prediction: Prediction, export_format: str, export_dir: str, **kwargs):
+    if "-" in export_format:
+        for fmt in export_format.split("-"):
+            export(prediction, fmt, export_dir, **kwargs)
+        return
+    if export_format == "glb":
+        from .glb import export_to_glb
+        export_to_glb(prediction, export_dir, **kwargs.get(export_format, {}))
+    elif export_format == "mini_npz":
+        from .npz import export_to_mini_npz
+        export_to_mini_npz(prediction, export_dir)
+    elif export_format == "npz":
+        from .npz import export_to_npz
+        export_to_npz(prediction, export_dir)
+    elif export_format == "feat_vis":
+        from .feat_vis import export_to_feat_vis
+        export_to_feat_vis(prediction, export_dir, **kwargs.get(export_format, {}))
+    elif export_format == "depth_vis":
+        from .depth_vis import export_to_depth_vis
+        export_to_depth_vis(prediction, export_dir)
+    elif export_format == "gs_ply":
+        from depth_anything_3.utils.export.gs import export_to_gs_ply
+        export_to_gs_ply(prediction, export_dir, **kwargs.get(export_format, {}))
+    elif export_format == "gs_video":
+        from depth_anything_3.utils.export.gs import export_to_gs_video
+        export_to_gs_video(prediction, export_dir, **kwargs.get(export_format, {}))
+    elif export_format == "colmap":
+        from .colmap import export_to_colmap
+        export_to_colmap(prediction, export_dir, **kwargs.get(export_format, {}))
+    else:
+        raise ValueError(f"Unsupported export format: {export_format}")
+
+
+__all__ = [export]
+PY
+fi
+
+# Fail-closed: official package required (server has no untrained fallback)
+echo ">>> Verifying depth_anything_3..."
+python3 - <<'PY'
+from depth_anything_3.api import DepthAnything3
+print("  DA3 OK:", DepthAnything3)
+PY
+
+# gsplat only when GS decoder features are requested
+if [[ "$FEATURE_SOURCE" == "gs_decoder" ]]; then
+  module load gcc/12.3
   if python3 -c "import gsplat" 2>/dev/null; then
-    echo ">>> gsplat already installed, skipping build"
+    echo ">>> gsplat already installed, skipping"
   else
-    echo ">>> Installing gsplat (this may take several minutes to compile CUDA kernels)..."
+    echo ">>> Installing gsplat (may take several minutes)..."
     timeout 600 pip install --no-build-isolation \
       git+https://github.com/nerfstudio-project/gsplat.git@v1.4.0 || {
-      echo ">>> gsplat install failed or timed out; GS decoder features may not be available"
-      echo ">>> Falling back to depth_decoder features"
-      FEATURE_SOURCE="depth_decoder"
-    }
+        echo ">>> gsplat install failed/timed out; falling back to depth_decoder"
+        FEATURE_SOURCE="depth_decoder"
+      }
   fi
-else
-  echo ">>> Skipping gsplat install (feature_source=$FEATURE_SOURCE, gsplat only needed for gs_decoder)"
 fi
 
-# Install the project itself (editable so scripts/ imports work)
-pip install --no-build-isolation -e . 2>/dev/null || {
-  echo ">>> Project pip install skipped (not a package); using PYTHONPATH"
-}
-
-# Add project root to PYTHONPATH
-export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
-
-# Verify GPU access
 echo ">>> Checking GPU..."
-python3 -c "import torch; print(f'  CUDA available: {torch.cuda.is_available()}'); print(f'  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
-
-# Create log directory
-mkdir -p logs "$OUTPUT_DIR"
+python3 -c "import torch; print(f'  CUDA: {torch.cuda.is_available()}'); print(f'  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
 
 # =====================================================================
-# Step 1: Start the V3 server in the background
+# Start V3 server
 # =====================================================================
 echo ""
 echo ">>> Starting Depth Anything V3 server on port $SERVER_PORT..."
-
 python3 -m spagent.external_experts.Depth_AnythingV2.depth_v3_server \
   --checkpoint_id "$CHECKPOINT_ID" \
   --port "$SERVER_PORT" \
   &> "logs/depth_v3_server_${SLURM_JOB_ID}.log" &
 SERVER_PID=$!
 
-# Wait for server to be ready (up to 5 minutes)
-echo ">>> Waiting for server to be ready..."
+echo ">>> Waiting for server health..."
 MAX_WAIT=300
 ELAPSED=0
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-  if curl -s "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
-    echo ">>> Server is ready (took ${ELAPSED}s)"
+while (( ELAPSED < MAX_WAIT )); do
+  if curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null; then
+    echo ">>> Server ready (${ELAPSED}s)"
     break
+  fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "ERROR: server process exited early"
+    tail -50 "logs/depth_v3_server_${SLURM_JOB_ID}.log" || true
+    exit 1
   fi
   sleep 5
   ELAPSED=$((ELAPSED + 5))
   echo "    ... waiting (${ELAPSED}s / ${MAX_WAIT}s)"
 done
 
-if [ $ELAPSED -ge $MAX_WAIT ]; then
-  echo "ERROR: Server did not become ready within ${MAX_WAIT}s"
-  echo "Server log tail:"
-  tail -30 "logs/depth_v3_server_${SLURM_JOB_ID}.log"
-  kill $SERVER_PID 2>/dev/null || true
+if (( ELAPSED >= MAX_WAIT )); then
+  echo "ERROR: Server not ready within ${MAX_WAIT}s"
+  tail -50 "logs/depth_v3_server_${SLURM_JOB_ID}.log" || true
   exit 1
 fi
 
 # =====================================================================
-# Step 2: Run batch inference
+# Batch inference
 # =====================================================================
 echo ""
 echo ">>> Running batch inference..."
 
-BATCH_CMD="python3 scripts/run_depth_v3_batch.py \
-  --data_path $DATA_PATH \
-  --image_root $IMAGE_ROOT \
-  --output_dir $OUTPUT_DIR \
-  --server_url http://127.0.0.1:$SERVER_PORT \
-  --save-metric-depth \
-  --save-features \
-  --feature-source $FEATURE_SOURCE"
-
-# Add max_images if specified
-if [ -n "$MAX_IMAGES" ]; then
-  BATCH_CMD="$BATCH_CMD --max_images $MAX_IMAGES"
+BATCH_ARGS=(
+  --data_path "$DATA_PATH"
+  --image_root "$IMAGE_ROOT"
+  --output_dir "$OUTPUT_DIR"
+  --server_url "http://127.0.0.1:${SERVER_PORT}"
+  --save-metric-depth
+  --save-features
+  --feature-source "$FEATURE_SOURCE"
+)
+if [[ -n "$MAX_IMAGES" ]]; then
+  BATCH_ARGS+=(--max_images "$MAX_IMAGES")
 fi
 
-echo ">>> Command: $BATCH_CMD"
-eval $BATCH_CMD
-
+echo ">>> Command: python3 scripts/run_depth_v3_batch.py ${BATCH_ARGS[*]}"
+set +e
+python3 scripts/run_depth_v3_batch.py "${BATCH_ARGS[@]}"
 BATCH_EXIT=$?
+set -e
 
 # =====================================================================
-# Step 3: Visualize outputs (no GPU needed)
+# Finish
 # =====================================================================
-if [ $BATCH_EXIT -eq 0 ]; then
-  echo ""
-  echo ">>> Generating visualizations..."
-  python3 scripts/visualize_depth_v3_outputs.py \
-    --output_dir "$OUTPUT_DIR" \
-    --image_root "$IMAGE_ROOT" \
-    --mode both \
-    --max_images 50 \
-    2>&1 || {
-      echo ">>> Visualization failed (non-fatal, outputs are still valid)"
-    }
-fi
-
-# =====================================================================
-# Step 4: Cleanup
-# =====================================================================
-echo ""
-echo ">>> Stopping server (PID $SERVER_PID)..."
-kill $SERVER_PID 2>/dev/null || true
-wait $SERVER_PID 2>/dev/null || true
-
-if [ $BATCH_EXIT -eq 0 ]; then
+if [[ $BATCH_EXIT -eq 0 ]]; then
   echo ""
   echo "============================================================"
   echo " Batch inference completed successfully!"
-  echo "============================================================"
   echo " Output directory: $OUTPUT_DIR"
   echo " Summary:          $OUTPUT_DIR/batch_summary.json"
   echo " Server log:       logs/depth_v3_server_${SLURM_JOB_ID}.log"
   echo "============================================================"
+  echo " Metric artifacts per image:"
+  echo "   *_metric_depth_16bit.png  (uint16 meters via scale/offset)"
+  echo "   *_metric_depth_vis.png    (color visualization only)"
+  echo "   *_metric.npy              (summary dict + scale/offset)"
+  echo "============================================================"
 else
   echo ""
   echo "ERROR: Batch inference failed with exit code $BATCH_EXIT"
-  echo "Server log tail:"
-  tail -50 "logs/depth_v3_server_${SLURM_JOB_ID}.log"
-  exit $BATCH_EXIT
+  tail -50 "logs/depth_v3_server_${SLURM_JOB_ID}.log" || true
+  exit "$BATCH_EXIT"
 fi

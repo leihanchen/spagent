@@ -25,6 +25,7 @@ class MockDepthV3Service:
     """Mock V3 depth estimation service — no GPU or checkpoint needed."""
 
     VALID_OUTPUT_MODES = ("depth", "metric_depth", "point_cloud", "gaussians", "features")
+    VALID_FEATURE_SOURCES = ("depth_decoder", "gs_decoder")
 
     def __init__(self, output_dir: str = "outputs"):
         self.output_dir = output_dir
@@ -48,6 +49,7 @@ class MockDepthV3Service:
         output_mode: str = "depth",
         return_metrics: bool = False,
         render_views: bool = False,
+        feature_source: str = "depth_decoder",
     ) -> Dict[str, Any]:
         """
         Mock inference that returns synthetic results for every output mode.
@@ -55,9 +57,11 @@ class MockDepthV3Service:
         Args:
             image_path: Path to input image (single or multi-view list).
             output_mode: One of ``depth``, ``metric_depth``, ``point_cloud``,
-                         ``gaussians``.
+                         ``gaussians``, ``features``.
             return_metrics: If True, include spatial metrics in the result.
             render_views: If True, include rendered base64 view images.
+            feature_source: ``"depth_decoder"`` or ``"gs_decoder"`` — selects
+                            which decoder's features to extract.
 
         Returns:
             Result dict matching the real client's return shape.
@@ -80,19 +84,34 @@ class MockDepthV3Service:
             timestamp = int(time.time())
             base_name = f"depth_v3_{stem}_{timestamp}"
 
-            # -- always generate the primary depth visualization ----------
-            depth_path = os.path.join(self.output_dir, f"{base_name}_depth.png")
-            shape = self._create_mock_depth_image(depth_path, output_mode)
+            # Synthetic metric depth (meters) used for 16-bit export
+            depth_m, shape = self._mock_metric_depth_array()
             camera_pose = self._mock_camera_pose()
 
             result: Dict[str, Any] = {
                 "success": True,
                 "backend": "v3",
                 "output_mode": output_mode,
-                "output_path": depth_path,
                 "shape": shape,
                 "camera_pose": camera_pose,
+                "is_metric": 1,
             }
+
+            # -- color visualization (not metric values) -----------------
+            if output_mode in ("depth", "metric_depth", "point_cloud", "gaussians", "features"):
+                depth_path = os.path.join(self.output_dir, f"{base_name}_depth.png")
+                self._create_mock_depth_image(depth_path, output_mode, depth_m=depth_m)
+                result["output_path"] = depth_path
+
+            # -- 16-bit metric depth PNG + scale (depth modes) -----------
+            if output_mode in ("depth", "metric_depth"):
+                u16_path = os.path.join(
+                    self.output_dir, f"{base_name}_metric_depth_16bit.png"
+                )
+                scale_info = self._save_metric_depth_16bit(depth_m, u16_path)
+                scale_info["is_metric"] = 1
+                result["metric_depth_16bit_path"] = u16_path
+                result["metric_depth_scale"] = scale_info
 
             # -- point cloud / gaussians modes ---------------------------
             if output_mode in ("point_cloud", "gaussians"):
@@ -114,12 +133,23 @@ class MockDepthV3Service:
             # -- features -----------------------------------------------
             if output_mode == "features":
                 features_path = os.path.join(self.output_dir, f"{base_name}_features.pth")
-                self._create_mock_features(features_path, stem, shape)
+                self._create_mock_features(
+                    features_path, stem, shape, feature_source=feature_source
+                )
                 result["features_path"] = features_path
 
-            # -- metrics -------------------------------------------------
-            if return_metrics:
-                result["metrics"] = self._mock_metrics(shape)
+            # -- metrics (summary dict + 16-bit scale) -------------------
+            if return_metrics or output_mode == "metric_depth":
+                metrics = self._mock_metrics(shape, depth_m=depth_m)
+                if result.get("metric_depth_scale"):
+                    metrics.update({
+                        "scale": result["metric_depth_scale"]["scale"],
+                        "offset": result["metric_depth_scale"]["offset"],
+                        "dtype": result["metric_depth_scale"]["dtype"],
+                        "formula": result["metric_depth_scale"]["formula"],
+                        "is_metric": 1,
+                    })
+                result["metrics"] = metrics
 
             logger.info(
                 "Mock V3 depth: mode=%s, image=%s", output_mode, image_path
@@ -134,40 +164,72 @@ class MockDepthV3Service:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _create_mock_depth_image(
-        self, output_path: str, output_mode: str
-    ) -> List[int]:
-        """Generate a synthetic depth visualization and save it."""
-        w, h = 640, 480
+    def _mock_metric_depth_array(self, h: int = 480, w: int = 640):
+        """Synthetic metric depth map in meters: vertical gradient 0.5–12.0 m."""
+        col = np.linspace(0.5, 12.0, h, dtype=np.float32).reshape(h, 1)
+        depth_m = np.broadcast_to(col, (h, w)).copy()
+        return depth_m, [h, w]
 
-        if output_mode == "metric_depth":
-            # Blue gradient with metric annotations
-            image = Image.new("RGB", (w, h), color=(30, 30, 80))
+    @staticmethod
+    def _save_metric_depth_16bit(depth_m: np.ndarray, output_path: str) -> Dict[str, Any]:
+        """Encode float meters to uint16 PNG; return scale info for recovery."""
+        d_min = float(depth_m.min())
+        d_max = float(depth_m.max())
+        if d_max > d_min:
+            scale = (d_max - d_min) / 65535.0
+            offset = d_min
+            depth_u16 = np.clip(
+                np.round((depth_m - offset) / scale), 0, 65535
+            ).astype(np.uint16)
         else:
+            scale = 1.0
+            offset = d_min
+            depth_u16 = np.zeros_like(depth_m, dtype=np.uint16)
+
+        # 16-bit grayscale PNG (Pillow 13+: fromarray(uint16) → I;16)
+        Image.fromarray(depth_u16).save(output_path)
+
+        return {
+            "scale": scale,
+            "offset": offset,
+            "depth_min_m": d_min,
+            "depth_max_m": d_max,
+            "dtype": "uint16",
+            "formula": "depth_m = scale * uint16 + offset",
+        }
+
+    def _create_mock_depth_image(
+        self,
+        output_path: str,
+        output_mode: str,
+        depth_m: Optional[np.ndarray] = None,
+    ) -> List[int]:
+        """Generate a synthetic depth visualization (color only) and save it."""
+        if depth_m is not None:
+            h, w = depth_m.shape
+            d_norm = (depth_m - depth_m.min()) / (depth_m.max() - depth_m.min() + 1e-8)
+            # Simple Spectral-like RGB from normalized depth (vis only)
+            r = (255 * (1.0 - d_norm)).astype(np.uint8)
+            g = (255 * np.sin(np.pi * d_norm)).astype(np.uint8)
+            b = (255 * d_norm).astype(np.uint8)
+            arr = np.stack([r, g, b], axis=-1)
+            image = Image.fromarray(arr, mode="RGB")
+        else:
+            w, h = 640, 480
             image = Image.new("RGB", (w, h), color=(50, 50, 50))
 
         draw = ImageDraw.Draw(image)
 
-        # Fake depth gradient bars
-        for y in range(h):
-            val = int(255 * y / h)
-            for x in range(w):
-                if output_mode == "metric_depth":
-                    color = (val // 2, val // 3, 255 - val // 3)
-                else:
-                    color = (val, val // 2, 255 - val)
-                draw.point((x, y), fill=color)
-
         # Overlay text
         mode_label = {
-            "depth": "Relative Depth (mock)",
-            "metric_depth": "Metric Depth (mock) — values in meters",
+            "depth": "Relative Depth (mock vis)",
+            "metric_depth": "Metric Depth (mock vis) — see *_16bit.png for meters",
             "point_cloud": "Point Cloud (mock)",
             "gaussians": "3D Gaussians (mock)",
-            "features": "Hidden Features (mock)",
+            "features": "3D DPT Decoder Features (mock)",
         }.get(output_mode, output_mode)
 
-        draw.rectangle([10, 10, 400, 80], fill=(0, 0, 0, 128))
+        draw.rectangle([10, 10, 520, 80], fill=(0, 0, 0, 128))
         draw.text((20, 20), f"DA3 V3 Mock — {mode_label}", fill=(255, 255, 255))
         draw.text((20, 45), f"Resolution: {w}x{h}", fill=(200, 200, 200))
 
@@ -255,37 +317,83 @@ end_header
             ],
         }
 
-    def _mock_metrics(self, shape: List[int]) -> Dict[str, Any]:
-        """Return synthetic spatial metrics."""
+    def _mock_metrics(
+        self, shape: List[int], depth_m: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
+        """Return synthetic spatial metrics (summary dict)."""
         h, w = shape
+        if depth_m is not None:
+            return {
+                "depth_min_m": float(depth_m.min()),
+                "depth_max_m": float(depth_m.max()),
+                "depth_mean_m": float(depth_m.mean()),
+                "point_count": int(depth_m.size),
+                "coverage_percent": float((depth_m > 0).sum() / depth_m.size * 100),
+                "is_metric": 1,
+            }
         return {
-            "depth_min_m": 0.51,
-            "depth_max_m": 12.34,
-            "depth_mean_m": 3.17,
+            "depth_min_m": 0.5,
+            "depth_max_m": 12.0,
+            "depth_mean_m": 6.25,
             "point_count": h * w,
-            "coverage_percent": 98.7,
+            "coverage_percent": 100.0,
+            "is_metric": 1,
         }
 
     def _create_mock_features(
-        self, output_path: str, image_id: str, shape: List[int]
+        self,
+        output_path: str,
+        image_id: str,
+        shape: List[int],
+        feature_source: str = "depth_decoder",
     ) -> None:
-        """Save a synthetic last-layer hidden feature tensor as .pth."""
+        """Save a synthetic 3D-aware feature tensor as .pth.
+
+        Produces a feature tensor [1, num_patches, 256] where the last
+        dimension is the 3D-aware feature vector (consistent with DINOv2
+        convention).
+
+        Args:
+            output_path: Path to save the .pth file.
+            image_id: Image identifier string.
+            shape: Image shape [H, W].
+            feature_source: ``"depth_decoder"`` for DualDPT depth features,
+                            or ``"gs_decoder"`` for GSDPT 3D Gaussian features.
+        """
         import torch
 
-        h, w = shape
-        patch_h, patch_w = h // 14, w // 14
-        embed_dim = 1536  # DINO giant embed dim
-        num_patches = patch_h * patch_w
+        if feature_source not in self.VALID_FEATURE_SOURCES:
+            logger.warning(
+                "Unknown feature_source '%s'; defaulting to 'depth_decoder'",
+                feature_source,
+            )
+            feature_source = "depth_decoder"
 
-        # Synthetic feature tensor
-        features = np.random.randn(1, num_patches, embed_dim).astype(np.float32)
+        h, w = shape
+        feature_dim = 256
+        feature_h = h // 14
+        feature_w = w // 14
+        num_patches = feature_h * feature_w
+
+        # Synthetic feature tensor: [1, num_patches, feature_dim]
+        features = np.random.randn(1, num_patches, feature_dim).astype(
+            np.float32
+        )
+
+        feature_type = (
+            "3d_gs_decoder" if feature_source == "gs_decoder"
+            else "3d_dpt_decoder"
+        )
 
         data = {
             "image_id": image_id,
             "features": torch.from_numpy(features),
-            "patch_h": patch_h,
-            "patch_w": patch_w,
-            "embed_dim": embed_dim,
+            "feature_h": feature_h,
+            "feature_w": feature_w,
+            "feature_dim": feature_dim,
+            "feature_type": feature_type,
+            "feature_source": feature_source,
+            "format_version": 2,
         }
         torch.save(data, output_path)
-        logger.info("Mock V3 features saved: %s", output_path)
+        logger.info("Mock V3 features saved: %s (source=%s, type=%s)", output_path, feature_source, feature_type)
