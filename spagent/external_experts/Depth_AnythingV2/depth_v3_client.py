@@ -87,7 +87,7 @@ class DepthV3Client:
             for p in paths:
                 if not os.path.exists(p):
                     return {"success": False, "error": f"Image file not found: {p}"}
-                img = cv2.imread(p)
+                img = self._imread_bgr(p)
                 if img is None:
                     return {"success": False, "error": f"Cannot read image: {p}"}
                 _, buf = cv2.imencode(".jpg", img)
@@ -113,7 +113,7 @@ class DepthV3Client:
                 f"{self.server_url}/infer",
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=120,
+                timeout=300,
             )
             resp.raise_for_status()
             server_result = resp.json()
@@ -162,7 +162,7 @@ class DepthV3Client:
             if not os.path.exists(image_path):
                 return {"success": False, "error": f"Image file not found: {image_path}"}
 
-            img = cv2.imread(image_path)
+            img = self._imread_bgr(image_path)
             if img is None:
                 return {"success": False, "error": f"Cannot read image: {image_path}"}
 
@@ -177,7 +177,7 @@ class DepthV3Client:
                     "feature_source": feature_source,
                 },
                 headers={"Content-Type": "application/json"},
-                timeout=120,
+                timeout=300,
             )
             resp.raise_for_status()
             server_result = resp.json()
@@ -267,17 +267,16 @@ class DepthV3Client:
             self._save_b64_image(server_result["depth_image"], depth_path)
             result["output_path"] = depth_path
 
-        # -- 16-bit metric-scale depth PNG + scale ---------------------
-        if server_result.get("metric_depth_u16_png"):
-            u16_path = os.path.join(
-                self.output_dir, f"{base_name}_metric_depth_16bit.png"
+        # -- float32 metric depth map (.npy; PNG cannot store floats) --
+        if server_result.get("metric_depth_f32_b64"):
+            shape = server_result.get("metric_depth_shape") or []
+            metric_path = os.path.join(
+                self.output_dir, f"{base_name}_metric_depth.npy"
             )
-            self._save_b64_bytes(server_result["metric_depth_u16_png"], u16_path)
-            result["metric_depth_16bit_path"] = u16_path
-
-        scale_info = server_result.get("metric_depth_scale") or {}
-        if scale_info:
-            result["metric_depth_scale"] = scale_info
+            self._save_metric_depth_f32(
+                server_result["metric_depth_f32_b64"], shape, metric_path
+            )
+            result["metric_depth_path"] = metric_path
 
         if server_result.get("is_metric") is not None:
             result["is_metric"] = server_result.get("is_metric")
@@ -300,14 +299,9 @@ class DepthV3Client:
         if server_result.get("rendered_views"):
             result["rendered_views"] = server_result["rendered_views"]
 
-        # -- metrics (summary + 16-bit encode params) ------------------
-        metrics = dict(server_result.get("metrics") or {})
-        if scale_info:
-            for key in ("scale", "offset", "dtype", "formula", "is_metric"):
-                if key in scale_info and key not in metrics:
-                    metrics[key] = scale_info[key]
-        if metrics:
-            result["metrics"] = metrics
+        # -- metrics (optional summary scalars only) -------------------
+        if server_result.get("metrics"):
+            result["metrics"] = server_result["metrics"]
 
         # -- 3D-aware features -------------------------------------------
         if server_result.get("features_b64"):
@@ -342,6 +336,25 @@ class DepthV3Client:
         return result
 
     @staticmethod
+    def _imread_bgr(path: str) -> Optional[np.ndarray]:
+        """Load an image as BGR uint8, with PIL fallback for GIF/WebP/etc."""
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
+        try:
+            from PIL import Image
+
+            with Image.open(path) as pil_img:
+                # Animated GIF: use first frame
+                pil_img.seek(0)
+                rgb = pil_img.convert("RGB")
+                arr = np.array(rgb)
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            logger.error("Failed to read image %s: %s", path, e)
+            return None
+
+    @staticmethod
     def _save_b64_image(b64_data: str, output_path: str) -> None:
         """Decode a base64 color image and write it to disk."""
         img_bytes = base64.b64decode(b64_data)
@@ -351,26 +364,16 @@ class DepthV3Client:
             cv2.imwrite(output_path, img)
 
     @staticmethod
-    def _save_b64_bytes(b64_data: str, output_path: str) -> None:
-        """Decode raw base64 bytes (e.g. 16-bit PNG) and write unchanged."""
-        with open(output_path, "wb") as f:
-            f.write(base64.b64decode(b64_data))
-
-    @staticmethod
-    def decode_depth_uint16(
-        png_path: str, scale: float, offset: float
-    ) -> np.ndarray:
-        """
-        Load a 16-bit depth PNG and recover float depth.
-
-        ``depth_m = scale * uint16 + offset``
-        """
-        depth_u16 = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
-        if depth_u16 is None:
-            raise FileNotFoundError(f"Cannot read 16-bit depth PNG: {png_path}")
-        if depth_u16.ndim == 3:
-            depth_u16 = depth_u16[:, :, 0]
-        return depth_u16.astype(np.float32) * float(scale) + float(offset)
+    def _save_metric_depth_f32(
+        depth_b64: str, shape, output_path: str
+    ) -> None:
+        """Decode base64 float32 bytes and save as ``.npy`` (meters)."""
+        raw = base64.b64decode(depth_b64)
+        arr = np.frombuffer(raw, dtype=np.float32)
+        if shape:
+            arr = arr.reshape(tuple(int(x) for x in shape))
+        np.save(output_path, np.ascontiguousarray(arr))
+        logger.info("V3 metric depth (float32) saved: %s shape=%s", output_path, arr.shape)
 
     @staticmethod
     def _save_features_pth(
