@@ -224,7 +224,7 @@ class DepthV3Client:
 
             # Feature visualization
             vis_path = output_path.replace("_features.pth", "_features_vis.png")
-            self._save_features_vis(
+            vis_result = self._save_features_vis(
                 server_result["features_b64"],
                 feature_h,
                 feature_w,
@@ -237,7 +237,7 @@ class DepthV3Client:
                 "backend": "v3",
                 "output_mode": "features",
                 "features_path": output_path,
-                "features_vis_path": vis_path if vis_path else None,
+                "features_vis_path": vis_result if vis_result else None,
                 "feature_h": feature_h,
                 "feature_w": feature_w,
                 "feature_dim": feature_dim,
