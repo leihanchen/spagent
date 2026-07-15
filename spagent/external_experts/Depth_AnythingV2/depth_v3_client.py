@@ -504,6 +504,13 @@ class DepthV3Client:
                         (col - col_min) / (col_max - col_min) * 255
                     ).astype(np.uint8)
 
+            # Warn on degenerate (all-black) output
+            if rgb.max() == 0:
+                logger.warning(
+                    "Feature vis all-black (degenerate features?); output_path=%s",
+                    output_path,
+                )
+
             # Reshape to spatial grid
             rgb = rgb.reshape(feature_h, feature_w, 3)
 

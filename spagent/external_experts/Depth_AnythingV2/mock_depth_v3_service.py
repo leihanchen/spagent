@@ -138,8 +138,9 @@ class MockDepthV3Service:
 
                 # Feature visualization (PCA→RGB)
                 vis_path = os.path.join(self.output_dir, f"{base_name}_features_vis.png")
-                self._create_mock_features_vis(vis_path, shape)
-                result["features_vis_path"] = vis_path
+                vis_result = self._create_mock_features_vis(vis_path, shape)
+                if vis_result:
+                    result["features_vis_path"] = vis_path
 
             # -- metrics (optional summary scalars only) -----------------
             if return_metrics or output_mode == "metric_depth":
@@ -370,58 +371,87 @@ end_header
         self,
         output_path: str,
         shape: List[int],
-    ) -> None:
+    ) -> str:
         """PCA→RGB visualization of synthetic 3D-aware features.
 
-        Generates random features matching the same shape as
-        ``_create_mock_features``, runs PCA via numpy SVD, and saves
-        a nearest-neighbor upsampled PNG.
+        Generates random features and delegates to
+        ``DepthV3Client._save_features_vis`` for PCA→RGB, ensuring
+        the mock output matches the real client's visualization.
+        Falls back to a local PCA pipeline if the client module
+        cannot be imported (e.g. cv2 unavailable).
 
         Args:
             output_path: Path to save the PNG.
             shape: Image shape [H, W].
+
+        Returns:
+            The output_path on success, empty string on failure.
         """
+        import base64
+
         h, w = shape
         feature_dim = 256
         feature_h = h // 14
         feature_w = w // 14
         num_patches = feature_h * feature_w
 
-        # Generate the same kind of random features as _create_mock_features
-        patches = np.random.randn(num_patches, feature_dim).astype(np.float32)
+        # Generate random features matching _create_mock_features shape
+        features = np.random.randn(1, num_patches, feature_dim).astype(np.float32)
+        features_b64 = base64.b64encode(features.tobytes()).decode("utf-8")
 
-        # PCA to 3 components via numpy SVD
-        n_components = min(3, feature_dim, num_patches)
-        centered = patches - patches.mean(axis=0, keepdims=True)
-        _U, _S, Vt = np.linalg.svd(centered, full_matrices=False)
-        projected = centered @ Vt[:n_components].T
+        # Prefer the real client's static method (single source of truth)
+        try:
+            from spagent.external_experts.Depth_AnythingV2.depth_v3_client import DepthV3Client
+            return DepthV3Client._save_features_vis(
+                features_b64, feature_h, feature_w, feature_dim, output_path,
+            )
+        except ImportError:
+            logger.debug(
+                "DepthV3Client unavailable (missing dep); using local PCA fallback"
+            )
 
-        # Pad to 3 channels if fewer components
-        if n_components < 3:
-            pad = np.zeros((num_patches, 3 - n_components), dtype=np.float32)
-            projected = np.concatenate([projected, pad], axis=1)
+        # Fallback: local PCA→RGB pipeline (mirrors _save_features_vis logic)
+        try:
+            patches = features.reshape(num_patches, feature_dim)
 
-        # Per-channel min-max normalization to [0, 255]
-        rgb = np.zeros((num_patches, 3), dtype=np.uint8)
-        for c in range(3):
-            col = projected[:, c]
-            col_min, col_max = float(col.min()), float(col.max())
-            if col_max - col_min > 1e-8:
-                rgb[:, c] = np.round(
-                    (col - col_min) / (col_max - col_min) * 255
-                ).astype(np.uint8)
+            n_components = min(3, feature_dim, num_patches)
+            centered = patches - patches.mean(axis=0, keepdims=True)
+            _U, _S, Vt = np.linalg.svd(centered, full_matrices=False)
+            projected = centered @ Vt[:n_components].T
 
-        # Reshape to spatial grid
-        rgb = rgb.reshape(feature_h, feature_w, 3)
+            if n_components < 3:
+                pad = np.zeros((num_patches, 3 - n_components), dtype=np.float32)
+                projected = np.concatenate([projected, pad], axis=1)
 
-        # Nearest-neighbor upsample to a reasonable display size
-        display_h = max(feature_h * 8, 224)
-        display_w = max(feature_w * 8, 224)
-        rgb_pil = Image.fromarray(rgb, mode="RGB").resize(
-            (display_w, display_h), Image.NEAREST
-        )
-        rgb_pil.save(output_path)
-        logger.info(
-            "Mock V3 features vis saved: %s (%dx%d grid → %dx%d)",
-            output_path, feature_w, feature_h, display_w, display_h,
-        )
+            rgb = np.zeros((num_patches, 3), dtype=np.uint8)
+            for c in range(3):
+                col = projected[:, c]
+                col_min, col_max = float(col.min()), float(col.max())
+                if col_max - col_min > 1e-8:
+                    rgb[:, c] = np.round(
+                        (col - col_min) / (col_max - col_min) * 255
+                    ).astype(np.uint8)
+
+            # Warn on degenerate (all-black) output
+            if rgb.max() == 0:
+                logger.warning(
+                    "Feature vis all-black (degenerate features?); output_path=%s",
+                    output_path,
+                )
+
+            rgb = rgb.reshape(feature_h, feature_w, 3)
+
+            display_h = max(feature_h * 8, 224)
+            display_w = max(feature_w * 8, 224)
+            rgb_pil = Image.fromarray(rgb, mode="RGB").resize(
+                (display_w, display_h), Image.NEAREST
+            )
+            rgb_pil.save(output_path)
+            logger.info(
+                "Mock V3 features vis saved (fallback): %s (%dx%d grid → %dx%d)",
+                output_path, feature_w, feature_h, display_w, display_h,
+            )
+            return output_path
+        except Exception as e:
+            logger.error("Mock V3 features vis failed: %s", e)
+            return ""
