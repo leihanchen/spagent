@@ -289,6 +289,35 @@ class TestDepthV3Tool:
         assert data["feature_source"] == "gs_decoder"
         assert data["format_version"] == 2
 
+    def test_v3_features_vis_png(self):
+        """V3 features mode should also produce a PCA→RGB visualization PNG."""
+        import numpy as np
+        from PIL import Image
+
+        from spagent.tools import DepthEstimationTool
+
+        tool = DepthEstimationTool(use_mock=True, backend="v3")
+        result = tool.call(
+            image_path="assets/example.png",
+            output_mode="features",
+            feature_source="depth_decoder",
+        )
+
+        assert result["success"] is True
+        assert "features_vis_path" in result
+        assert result["features_vis_path"] is not None
+        assert os.path.exists(result["features_vis_path"])
+        assert result["features_vis_path"].endswith("_features_vis.png")
+
+        # Verify it's a valid RGB image
+        img = Image.open(result["features_vis_path"])
+        assert img.mode == "RGB"
+        arr = np.array(img)
+        assert arr.ndim == 3
+        assert arr.shape[2] == 3
+        # Should not be all-black (PCA of random features produces color)
+        assert arr.max() > 0
+
     def test_v3_features_spatial_structure(self):
         """3D features should vary across patches (not uniform)."""
         import torch

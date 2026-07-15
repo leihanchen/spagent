@@ -222,11 +222,22 @@ class DepthV3Client:
                 output_path,
             )
 
+            # Feature visualization
+            vis_path = output_path.replace("_features.pth", "_features_vis.png")
+            self._save_features_vis(
+                server_result["features_b64"],
+                feature_h,
+                feature_w,
+                feature_dim,
+                vis_path,
+            )
+
             return {
                 "success": True,
                 "backend": "v3",
                 "output_mode": "features",
                 "features_path": output_path,
+                "features_vis_path": vis_path if vis_path else None,
                 "feature_h": feature_h,
                 "feature_w": feature_w,
                 "feature_dim": feature_dim,
@@ -332,6 +343,18 @@ class DepthV3Client:
             )
             result["features_path"] = features_path
 
+            # -- feature visualization (PCA→RGB) -------------------------
+            vis_path = os.path.join(self.output_dir, f"{base_name}_features_vis.png")
+            vis_result = self._save_features_vis(
+                server_result["features_b64"],
+                feature_h,
+                feature_w,
+                feature_dim,
+                vis_path,
+            )
+            if vis_result:
+                result["features_vis_path"] = vis_path
+
         logger.info("V3 client: result saved, mode=%s", result.get("output_mode"))
         return result
 
@@ -417,3 +440,85 @@ class DepthV3Client:
             "V3 features saved: %s (type=%s, source=%s, v%d)",
             output_path, feature_type, feature_source, format_version,
         )
+
+    @staticmethod
+    def _save_features_vis(
+        features_b64: str,
+        feature_h: int,
+        feature_w: int,
+        feature_dim: int,
+        output_path: str,
+    ) -> str:
+        """PCA→RGB visualization of 3D-aware features.
+
+        Decodes base64 features, projects to 3 components via numpy SVD,
+        normalizes each channel to [0, 255], reshapes to the patch grid,
+        upsamples to a reasonable display size, and saves as PNG.
+
+        Args:
+            features_b64: Base64-encoded float32 feature bytes.
+            feature_h: Patch grid height.
+            feature_w: Patch grid width.
+            feature_dim: Feature vector dimension (typically 256).
+            output_path: Path to save the PNG.
+
+        Returns:
+            The output_path on success, empty string on failure.
+        """
+        from PIL import Image as PILImage
+
+        try:
+            # Decode features
+            features_bytes = base64.b64decode(features_b64)
+            patches = np.frombuffer(features_bytes, np.float32).copy()
+
+            num_patches = feature_h * feature_w
+            if num_patches > 0 and feature_dim > 0:
+                patches = patches.reshape(num_patches, feature_dim)
+            else:
+                logger.warning(
+                    "Invalid feature dims for vis: h=%d w=%d dim=%d; skipping vis",
+                    feature_h, feature_w, feature_dim,
+                )
+                return ""
+
+            # PCA to 3 components via numpy SVD (no sklearn needed)
+            n_components = min(3, feature_dim, num_patches)
+            centered = patches - patches.mean(axis=0, keepdims=True)
+            # Economy SVD: U(N×k), S(k), Vt(k×D) — only need Vt for projection
+            _U, _S, Vt = np.linalg.svd(centered, full_matrices=False)
+            projected = centered @ Vt[:n_components].T  # (N, n_components)
+
+            # Pad to 3 channels if fewer components
+            if n_components < 3:
+                pad = np.zeros((num_patches, 3 - n_components), dtype=np.float32)
+                projected = np.concatenate([projected, pad], axis=1)
+
+            # Per-channel min-max normalization to [0, 255]
+            rgb = np.zeros((num_patches, 3), dtype=np.uint8)
+            for c in range(3):
+                col = projected[:, c]
+                col_min, col_max = float(col.min()), float(col.max())
+                if col_max - col_min > 1e-8:
+                    rgb[:, c] = np.round(
+                        (col - col_min) / (col_max - col_min) * 255
+                    ).astype(np.uint8)
+
+            # Reshape to spatial grid
+            rgb = rgb.reshape(feature_h, feature_w, 3)
+
+            # Nearest-neighbor upsample to a reasonable display size
+            display_h = max(feature_h * 8, 224)
+            display_w = max(feature_w * 8, 224)
+            rgb_pil = PILImage.fromarray(rgb, mode="RGB").resize(
+                (display_w, display_h), PILImage.NEAREST
+            )
+            rgb_pil.save(output_path)
+            logger.info(
+                "V3 features vis saved: %s (%dx%d grid → %dx%d)",
+                output_path, feature_w, feature_h, display_w, display_h,
+            )
+            return output_path
+        except Exception as e:
+            logger.error("V3 features vis failed: %s", e)
+            return ""
