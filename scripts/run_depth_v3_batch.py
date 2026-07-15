@@ -166,8 +166,10 @@ def check_existing_outputs(
     if save_flags.get("gaussians"):
         expected.append(os.path.join(source_dir, f"{image_id}_gs.ply"))
     features_path = os.path.join(source_dir, f"{image_id}_features.pth")
+    features_vis_path = os.path.join(source_dir, f"{image_id}_features_vis.png")
     if save_flags.get("features"):
         expected.append(features_path)
+        expected.append(features_vis_path)
 
     if not all(os.path.exists(p) for p in expected):
         return False
@@ -349,6 +351,11 @@ def run_batch(
                         result.get("features_path"),
                         source_dir,
                         f"{image_id}_features.pth",
+                    )
+                    _copy_output(
+                        result.get("features_vis_path"),
+                        source_dir,
+                        f"{image_id}_features_vis.png",
                     )
                 else:
                     image_errors.append(f"features: {result.get('error', 'unknown')}")
