@@ -299,6 +299,8 @@ if [[ $BATCH_EXIT -eq 0 ]]; then
   echo " Metric artifacts per image:"
   echo "   *_metric_depth.npy        (float32 meters, HxW)"
   echo "   *_metric_depth_vis.png    (color visualization only)"
+  echo "   *_features.pth            (3D-aware features, 256-dim per patch)"
+  echo "   *_features_vis.png        (PCA→RGB feature visualization)"
   echo "   *_metrics.json            (optional min/max summary)"
   echo "============================================================"
 else
