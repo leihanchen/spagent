@@ -149,9 +149,8 @@ class TestDepthV3Tool:
         assert "intrinsics" in result["camera_pose"]
 
     def test_v3_metric_depth_mode(self):
-        """V3 metric_depth mode should return 16-bit metric PNG + scale summary."""
+        """V3 metric_depth mode should return float32 metric depth .npy."""
         import numpy as np
-        from PIL import Image
 
         from spagent.tools import DepthEstimationTool
 
@@ -168,25 +167,19 @@ class TestDepthV3Tool:
         assert "depth_min_m" in result["metrics"]
         assert "depth_max_m" in result["metrics"]
         assert "depth_mean_m" in result["metrics"]
-        # 16-bit metric map + linear scale for recovery
-        assert "metric_depth_16bit_path" in result
-        assert result["metric_depth_16bit_path"] is not None
-        assert os.path.exists(result["metric_depth_16bit_path"])
-        assert "scale" in result["metrics"]
-        assert "offset" in result["metrics"]
-        assert "formula" in result["metrics"]
-        assert result["metrics"]["formula"] == "depth_m = scale * uint16 + offset"
+        assert "scale" not in result["metrics"]
+        assert "offset" not in result["metrics"]
+        # Float32 HxW depth in meters (PNG cannot store IEEE floats)
+        assert "metric_depth_path" in result
+        assert result["metric_depth_path"] is not None
+        assert os.path.exists(result["metric_depth_path"])
+        assert result["metric_depth_path"].endswith(".npy")
 
-        # Round-trip: recovered depth should match summary min/max within quant error
-        depth_u16 = np.array(Image.open(result["metric_depth_16bit_path"]))
-        assert depth_u16.dtype == np.uint16 or str(depth_u16.dtype).startswith("uint16") or depth_u16.dtype == np.int32
-        # PIL I;16 may load as int32; values still in 0..65535
-        depth_u16 = depth_u16.astype(np.uint16)
-        scale = float(result["metrics"]["scale"])
-        offset = float(result["metrics"]["offset"])
-        recovered = depth_u16.astype(np.float32) * scale + offset
-        assert abs(float(recovered.min()) - float(result["metrics"]["depth_min_m"])) < 1e-2
-        assert abs(float(recovered.max()) - float(result["metrics"]["depth_max_m"])) < 1e-2
+        depth = np.load(result["metric_depth_path"])
+        assert depth.dtype == np.float32
+        assert depth.ndim == 2
+        assert abs(float(depth.min()) - float(result["metrics"]["depth_min_m"])) < 1e-5
+        assert abs(float(depth.max()) - float(result["metrics"]["depth_max_m"])) < 1e-5
 
     def test_v3_point_cloud_mode(self):
         """V3 point_cloud mode should return PLY file."""

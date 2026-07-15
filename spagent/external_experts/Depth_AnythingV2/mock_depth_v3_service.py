@@ -103,15 +103,13 @@ class MockDepthV3Service:
                 self._create_mock_depth_image(depth_path, output_mode, depth_m=depth_m)
                 result["output_path"] = depth_path
 
-            # -- 16-bit metric depth PNG + scale (depth modes) -----------
+            # -- float32 metric depth map (.npy, meters) ---------------
             if output_mode in ("depth", "metric_depth"):
-                u16_path = os.path.join(
-                    self.output_dir, f"{base_name}_metric_depth_16bit.png"
+                metric_path = os.path.join(
+                    self.output_dir, f"{base_name}_metric_depth.npy"
                 )
-                scale_info = self._save_metric_depth_16bit(depth_m, u16_path)
-                scale_info["is_metric"] = 1
-                result["metric_depth_16bit_path"] = u16_path
-                result["metric_depth_scale"] = scale_info
+                np.save(metric_path, np.ascontiguousarray(depth_m, dtype=np.float32))
+                result["metric_depth_path"] = metric_path
 
             # -- point cloud / gaussians modes ---------------------------
             if output_mode in ("point_cloud", "gaussians"):
@@ -138,18 +136,9 @@ class MockDepthV3Service:
                 )
                 result["features_path"] = features_path
 
-            # -- metrics (summary dict + 16-bit scale) -------------------
+            # -- metrics (optional summary scalars only) -----------------
             if return_metrics or output_mode == "metric_depth":
-                metrics = self._mock_metrics(shape, depth_m=depth_m)
-                if result.get("metric_depth_scale"):
-                    metrics.update({
-                        "scale": result["metric_depth_scale"]["scale"],
-                        "offset": result["metric_depth_scale"]["offset"],
-                        "dtype": result["metric_depth_scale"]["dtype"],
-                        "formula": result["metric_depth_scale"]["formula"],
-                        "is_metric": 1,
-                    })
-                result["metrics"] = metrics
+                result["metrics"] = self._mock_metrics(shape, depth_m=depth_m)
 
             logger.info(
                 "Mock V3 depth: mode=%s, image=%s", output_mode, image_path
@@ -169,34 +158,6 @@ class MockDepthV3Service:
         col = np.linspace(0.5, 12.0, h, dtype=np.float32).reshape(h, 1)
         depth_m = np.broadcast_to(col, (h, w)).copy()
         return depth_m, [h, w]
-
-    @staticmethod
-    def _save_metric_depth_16bit(depth_m: np.ndarray, output_path: str) -> Dict[str, Any]:
-        """Encode float meters to uint16 PNG; return scale info for recovery."""
-        d_min = float(depth_m.min())
-        d_max = float(depth_m.max())
-        if d_max > d_min:
-            scale = (d_max - d_min) / 65535.0
-            offset = d_min
-            depth_u16 = np.clip(
-                np.round((depth_m - offset) / scale), 0, 65535
-            ).astype(np.uint16)
-        else:
-            scale = 1.0
-            offset = d_min
-            depth_u16 = np.zeros_like(depth_m, dtype=np.uint16)
-
-        # 16-bit grayscale PNG (Pillow 13+: fromarray(uint16) → I;16)
-        Image.fromarray(depth_u16).save(output_path)
-
-        return {
-            "scale": scale,
-            "offset": offset,
-            "depth_min_m": d_min,
-            "depth_max_m": d_max,
-            "dtype": "uint16",
-            "formula": "depth_m = scale * uint16 + offset",
-        }
 
     def _create_mock_depth_image(
         self,
@@ -223,7 +184,7 @@ class MockDepthV3Service:
         # Overlay text
         mode_label = {
             "depth": "Relative Depth (mock vis)",
-            "metric_depth": "Metric Depth (mock vis) — see *_16bit.png for meters",
+            "metric_depth": "Metric Depth (mock vis) — see *_metric_depth.npy for meters",
             "point_cloud": "Point Cloud (mock)",
             "gaussians": "3D Gaussians (mock)",
             "features": "3D DPT Decoder Features (mock)",
@@ -330,6 +291,7 @@ end_header
                 "point_count": int(depth_m.size),
                 "coverage_percent": float((depth_m > 0).sum() / depth_m.size * 100),
                 "is_metric": 1,
+                "dtype": "float32",
             }
         return {
             "depth_min_m": 0.5,
@@ -338,6 +300,7 @@ end_header
             "point_count": h * w,
             "coverage_percent": 100.0,
             "is_metric": 1,
+            "dtype": "float32",
         }
 
     def _create_mock_features(

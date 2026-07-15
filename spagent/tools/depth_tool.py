@@ -190,8 +190,8 @@ class DepthEstimationTool(Tool):
                     "type": "string",
                     "enum": list(self.V3_OUTPUT_MODES),
                     "description": (
-                        "Output mode: 'depth' — relative depth map (color vis + 16-bit); "
-                        "'metric_depth' — absolute depth in meters (16-bit PNG + scale, color is vis only); "
+                        "Output mode: 'depth' — relative depth map (color vis + float32 .npy); "
+                        "'metric_depth' — absolute depth in meters (float32 .npy, color is vis only); "
                         "'point_cloud' — PLY point cloud; "
                         "'gaussians' — 3D Gaussian Splatting (GS PLY + rendered views); "
                         "'features' — 3D-aware features from depth or Gaussian decoder "

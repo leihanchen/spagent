@@ -98,46 +98,18 @@ def load_model(checkpoint_id: str = "depth-anything/DA3NESTED-GIANT-LARGE-1.1") 
         return False
 
 
-def encode_depth_uint16(depth: np.ndarray):
+def encode_depth_f32(depth: np.ndarray) -> tuple:
     """
-    Linearly encode a float depth map to uint16 for 16-bit PNG storage.
+    Pack a float32 metric depth map for JSON transport.
 
-    Recovery: ``depth_m = scale * uint16_pixel + offset``.
+    Standard PNG cannot store IEEE floats; clients save this as ``.npy``.
 
     Returns:
-        (depth_u16, scale_info dict)
+        (base64_str, shape_list) for a contiguous float32 HxW array.
     """
-    depth = np.asarray(depth, dtype=np.float32)
-    d_min = float(np.nanmin(depth))
-    d_max = float(np.nanmax(depth))
-    if not np.isfinite(d_min) or not np.isfinite(d_max):
-        d_min, d_max = 0.0, 0.0
-
-    if d_max > d_min:
-        scale = (d_max - d_min) / 65535.0
-        offset = d_min
-        depth_u16 = np.clip(
-            np.round((depth - offset) / scale), 0, 65535
-        ).astype(np.uint16)
-    else:
-        scale = 1.0
-        offset = d_min
-        depth_u16 = np.zeros(depth.shape, dtype=np.uint16)
-
-    scale_info = {
-        "scale": scale,
-        "offset": offset,
-        "depth_min_m": d_min,
-        "depth_max_m": d_max,
-        "dtype": "uint16",
-        "formula": "depth_m = scale * uint16 + offset",
-    }
-    return depth_u16, scale_info
-
-
-def decode_depth_uint16(depth_u16: np.ndarray, scale: float, offset: float) -> np.ndarray:
-    """Recover float depth from a uint16 map: depth_m = scale * u16 + offset."""
-    return depth_u16.astype(np.float32) * float(scale) + float(offset)
+    depth_f32 = np.ascontiguousarray(depth, dtype=np.float32)
+    b64 = base64.b64encode(depth_f32.tobytes()).decode("utf-8")
+    return b64, list(depth_f32.shape)
 
 
 def _colorize_depth(depth_norm: np.ndarray) -> np.ndarray:
@@ -279,14 +251,11 @@ def infer():
             _, buf = cv2.imencode(".png", depth_color)
             response["depth_image"] = base64.b64encode(buf).decode("utf-8")
 
-            # -- 16-bit metric-scale depth PNG + linear scale ----------
-            depth_u16, scale_info = encode_depth_uint16(depth)
-            scale_info["is_metric"] = int(depth_meta.get("is_metric", 0) or 0)
-            ok, u16_buf = cv2.imencode(".png", depth_u16)
-            if not ok:
-                raise RuntimeError("Failed to encode 16-bit depth PNG")
-            response["metric_depth_u16_png"] = base64.b64encode(u16_buf).decode("utf-8")
-            response["metric_depth_scale"] = scale_info
+            # -- float32 metric depth (PNG cannot store IEEE floats) ---
+            f32_b64, f32_shape = encode_depth_f32(depth)
+            response["metric_depth_f32_b64"] = f32_b64
+            response["metric_depth_shape"] = f32_shape
+            response["metric_depth_dtype"] = "float32"
 
         # -- Point cloud (PLY) -----------------------------------------
         if output_mode in ("point_cloud", "gaussians"):
@@ -300,9 +269,9 @@ def infer():
         if render_views and output_mode in ("point_cloud", "gaussians"):
             response["rendered_views"] = _mock_render_views(depth_norm)
 
-        # -- Metrics (summary scalars + 16-bit scale) ------------------
+        # -- Metrics (summary scalars only; depth map is float32 .npy) --
         if return_metrics or output_mode == "metric_depth":
-            metrics = {
+            response["metrics"] = {
                 "depth_min_m": float(np.nanmin(depth)),
                 "depth_max_m": float(np.nanmax(depth)),
                 "depth_mean_m": float(np.nanmean(depth)),
@@ -311,15 +280,8 @@ def infer():
                     (depth > 0).sum() / max(depth.size, 1) * 100
                 ),
                 "is_metric": int(depth_meta.get("is_metric", 0) or 0),
+                "dtype": "float32",
             }
-            if response.get("metric_depth_scale"):
-                metrics.update({
-                    "scale": response["metric_depth_scale"]["scale"],
-                    "offset": response["metric_depth_scale"]["offset"],
-                    "dtype": response["metric_depth_scale"]["dtype"],
-                    "formula": response["metric_depth_scale"]["formula"],
-                })
-            response["metrics"] = metrics
 
         # -- 3D-aware features -------------------------------------------
         if output_mode == "features":
